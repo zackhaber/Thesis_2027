@@ -1,0 +1,7 @@
+level: 2
+grid_size: 10
+pursuers: 2
+evaders: 1
+obstacle_density: 0.12
+goals: 2
+seed: 102

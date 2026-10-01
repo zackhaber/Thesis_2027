@@ -1,0 +1,6 @@
+{
+  "algorithm": "QMIX",
+  "episodes": 3,
+  "final_reward": 0.11751389460797075,
+  "final_loss": 0.33333333333333337
+}
