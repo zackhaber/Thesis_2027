@@ -9,6 +9,7 @@ from ui import run_gui
 
 
 def build_parser() -> argparse.ArgumentParser:
+    # Define the command-line entry points and their experiment-specific options.
     parser = argparse.ArgumentParser(description="Run the pursuit-evasion experiments.")
     subparsers = parser.add_subparsers(dest="command")
 
@@ -30,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    # Dispatch the selected command to the corresponding project driver.
     parser = build_parser()
     args = parser.parse_args()
 

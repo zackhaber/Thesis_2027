@@ -9,6 +9,7 @@ def make_environment(level: int = 1, seed: int = 7):
 def run_classical_suite(levels=(1, 2, 3)):
     rows = []
     for level in levels:
+        # Use the level number as a stable seed so all planners share one scenario.
         scenario = generate_level(DifficultySpec(level=level, seed=level))
         for planner in (cbs_plan, mstar_plan, voronoi_plan):
             result = planner(scenario)

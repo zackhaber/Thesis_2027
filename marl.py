@@ -16,10 +16,12 @@ class TabularMixer:
         self.rng = Random(seed)
 
     def train(self, episodes: int = 100) -> TrainingResult:
+        # This is a lightweight synthetic baseline, not a full MARL implementation.
         rewards: list[float] = []
         losses: list[float] = []
         value = 0.0
         for episode in range(episodes):
+            # Move the synthetic value gradually toward its target and add noise.
             value += (1.0 - value) * 0.03
             rewards.append(value + self.rng.uniform(-0.1, 0.1))
             losses.append(max(0.0, 1.0 - episode / max(1, episodes)))
