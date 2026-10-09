@@ -88,44 +88,68 @@ def _has_open_neighbor(position: Position, size: int, barrels: frozenset[Positio
     return False
 
 
+def _reachable(start: Position, size: int, barrels: frozenset[Position], walls: frozenset[tuple[Position, Direction]]) -> set[Position]:
+    reached = {start}
+    pending = [start]
+    while pending:
+        current = pending.pop()
+        for direction, (row_delta, col_delta) in MOVEMENT_DELTAS.items():
+            neighbor = (current[0] + row_delta, current[1] + col_delta)
+            if not (0 <= neighbor[0] < size and 0 <= neighbor[1] < size):
+                continue
+            if neighbor in barrels or (current, direction) in walls or (neighbor, OPPOSITE_DIRECTION[direction]) in walls:
+                continue
+            if neighbor not in reached:
+                reached.add(neighbor)
+                pending.append(neighbor)
+    return reached
+
+
+def _is_valid_scenario(
+    pursuers: list[Position],
+    evaders: tuple[Position, ...],
+    goals: tuple[Position, ...],
+    size: int,
+    barrels: frozenset[Position],
+    walls: frozenset[tuple[Position, Direction]],
+) -> bool:
+    required = set(pursuers) | set(evaders) | set(goals)
+    if not required:
+        return False
+    reachable = _reachable(next(iter(required)), size, barrels, walls)
+    if not required.issubset(reachable):
+        return False
+    if evaders and min(_distance(pursuer, evaders[0]) for pursuer in pursuers) < 2:
+        return False
+    return True
+
+
 def generate_level(spec: DifficultySpec, mode: GameMode = GameMode.PURE_PURSUIT) -> Scenario:
-    # Build a reproducible board by shuffling cells, placing agents, then obstacles.
+    # Retry from deterministic derived seeds until the board is connected and fair.
     size, barrel_density, wall_density, pursuer_speed, evader_speed = _preset(spec)
     if mode == GameMode.MAZE:
         # Maze mode replaces barrels with a much denser wall layout.
         wall_density = MAZE_WALL_DENSITY
-    rng = Random(spec.seed)
-    cells = [(row, col) for row in range(size) for col in range(size)]
-    rng.shuffle(cells)
     preset = LEVEL_PRESETS.get(spec.level, LEVEL_PRESETS[2])
     pursuer_count = spec.pursuers if spec.pursuers is not None else preset["pursuers"]
-    pursuer_positions = [cells.pop() for _ in range(pursuer_count)]
-    barrel_count = min(len(cells), int(size * size * barrel_density))
-    barrels = frozenset(cells.pop() for _ in range(barrel_count)) if mode != GameMode.MAZE else frozenset()
-    wall_count = min(len(cells), int(size * size * wall_density))
-    directions = ("up", "down", "left", "right")
-    walls = frozenset((cells.pop(), rng.choice(directions)) for _ in range(wall_count))
-    if mode == GameMode.MAZE:
-        # Move any isolated pursuer to a cell with at least one traversable neighbor.
-        for index, pursuer in enumerate(pursuer_positions):
-            if _has_open_neighbor(pursuer, size, barrels, walls):
-                continue
-            replacement_index = next(
-                (cell_index for cell_index, cell in enumerate(cells) if _has_open_neighbor(cell, size, barrels, walls)),
-                None,
-            )
-            if replacement_index is not None:
-                pursuer_positions[index], cells[replacement_index] = cells[replacement_index], pursuer
-    if mode in GOAL_MODES:
-        # Place goals first, then start evaders in cells farthest from those goals.
-        goals = tuple(cell for cell in cells if cell not in barrels)[: max(1, spec.goals)]
-        if not goals:
-            goals = (next(cell for cell in cells if cell not in barrels),)
-        available_evader_cells = [cell for cell in cells if cell not in goals and cell not in barrels]
-        available_evader_cells.sort(key=lambda cell: min(_distance(cell, goal) for goal in goals), reverse=True)
-        evader_positions = tuple(available_evader_cells[: spec.evaders])
-    else:
-        # Pure pursuit has no goal condition, so remaining cells become evader starts.
-        goals = ()
-        evader_positions = tuple(cells.pop() for _ in range(spec.evaders))
-    return Scenario(size, size, tuple(pursuer_positions), evader_positions, barrels, walls, goals, pursuer_speed, evader_speed, spec.seed)
+    for attempt in range(100):
+        rng = Random(spec.seed + attempt)
+        cells = [(row, col) for row in range(size) for col in range(size)]
+        rng.shuffle(cells)
+        pursuer_positions = [cells.pop() for _ in range(pursuer_count)]
+        barrel_count = min(len(cells), int(size * size * barrel_density))
+        barrels = frozenset(cells.pop() for _ in range(barrel_count)) if mode != GameMode.MAZE else frozenset()
+        wall_count = min(len(cells), int(size * size * wall_density))
+        directions = ("up", "down", "left", "right")
+        walls = frozenset((cells.pop(), rng.choice(directions)) for _ in range(wall_count))
+        if mode in GOAL_MODES:
+            goals = tuple(cell for cell in cells if cell not in barrels)[: max(1, spec.goals)]
+            available_evader_cells = [cell for cell in cells if cell not in goals and cell not in barrels]
+            available_evader_cells.sort(key=lambda cell: min(_distance(cell, goal) for goal in goals), reverse=True)
+            evader_positions = tuple(available_evader_cells[: spec.evaders])
+        else:
+            goals = ()
+            evader_positions = tuple(cells.pop() for _ in range(spec.evaders))
+        if _is_valid_scenario(pursuer_positions, evader_positions, goals, size, barrels, walls):
+            return Scenario(size, size, tuple(pursuer_positions), evader_positions, barrels, walls, goals, pursuer_speed, evader_speed, spec.seed + attempt)
+    raise ValueError(f"Could not generate a valid level for seed {spec.seed}")

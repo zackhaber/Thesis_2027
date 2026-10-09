@@ -3,10 +3,8 @@ import json
 import subprocess
 import sys
 
-from marl import build_agent
 from notebooks import run_classical_suite
 from ui import run_gui
-
 
 def build_parser() -> argparse.ArgumentParser:
     # Define the command-line entry points and their experiment-specific options.
@@ -21,7 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--levels", type=int, nargs="+", choices=(1, 2, 3), default=(1, 2, 3))
 
     train = subparsers.add_parser("train", help="Run a lightweight MARL training baseline.")
-    train.add_argument("--algorithm", choices=("VDN", "QMIX", "QTRAN", "QPLEX"), default="VDN")
+    train.add_argument("--algorithm", choices=("IQL", "VDN", "QMIX", "QTRAN", "QPLEX"), default="VDN")
     train.add_argument("--episodes", type=int, default=100)
     train.add_argument("--seed", type=int, default=7)
 
@@ -42,6 +40,12 @@ def main() -> int:
         print(json.dumps(run_classical_suite(args.levels), indent=2))
         return 0
     if args.command == "train":
+        try:
+            from marl import build_agent
+        except ModuleNotFoundError as error:
+            if error.name == "torch":
+                parser.error("PyTorch is required for training. Install it with: python -m pip install torch")
+            raise
         result = build_agent(args.algorithm, args.seed).train(args.episodes)
         print(json.dumps({"algorithm": result.algorithm, "episodes": len(result.rewards), "final_reward": result.rewards[-1], "final_loss": result.losses[-1]}, indent=2))
         return 0

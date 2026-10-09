@@ -1,0 +1,37 @@
+﻿Thesis_2027 folder structure
+Generated: 2026-10-09 12:14:19
+Excluded: .git, env, __pycache__, .pytest_cache
+
+Thesis_2027\
+|-- .vscode\
+|   \-- settings.json
+|-- configs\
+|   |-- difficulty_1.yaml
+|   |-- difficulty_2.yaml
+|   \-- difficulty_3.yaml
+|-- marl\
+|   |-- __init__.py
+|   |-- base.py
+|   |-- iql.py
+|   |-- qmix.py
+|   |-- qplex.py
+|   |-- qtran.py
+|   |-- trainer.py
+|   \-- vdn.py
+|-- planners\
+|   |-- __init__.py
+|   |-- cbs.py
+|   |-- mstar.py
+|   |-- time_expanded.py
+|   \-- voronoi.py
+|-- tests\
+|   \-- test_environment.py
+|-- .gitignore
+|-- evaluation.py
+|-- main.py
+|-- notebooks.py
+|-- README.ipynb
+|-- requirements.txt
+|-- scenarios.py
+|-- ui.py
+\-- utils.py

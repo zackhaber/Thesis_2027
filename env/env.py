@@ -1,18 +1,16 @@
 from dataclasses import dataclass
-from random import SystemRandom
+from random import Random
 from typing import Literal
 
 from .game_modes import GameMode
 from .level_generator import Position, Scenario
 
 Action = Literal["stay", "up", "down", "left", "right"]
+ACTION_ORDER: tuple[Action, ...] = ("stay", "up", "down", "left", "right")
 MOVES: dict[Action, tuple[int, int]] = {"stay": (0, 0), "up": (-1, 0), "down": (1, 0), "left": (0, -1), "right": (0, 1)}
 OPPOSITE_ACTION: dict[Action, Action] = {"stay": "stay", "up": "down", "down": "up", "left": "right", "right": "left"}
 PURSUER_ALTERNATIVE_ACTIONS: tuple[Action, ...] = ("up", "down", "left", "right", "stay")
 GOAL_MODES = (GameMode.REACH_AVOID, GameMode.MAZE)
-# Use an independent random source for contested pursuer moves.
-COLLISION_RANDOM = SystemRandom()
-
 @dataclass
 class State:
     pursuers: list[Position]
@@ -20,22 +18,35 @@ class State:
     step_count: int
 
 class PursuitEvasionEnv:
-    def __init__(self, scenario: Scenario, mode: GameMode = GameMode.PURE_PURSUIT, max_steps: int = 200):
+    def __init__(self, scenario: Scenario, mode: GameMode = GameMode.PURE_PURSUIT, max_steps: int = 200, seed: int | None = None):
         # Keep the immutable scenario separate from the mutable episode state.
         self.scenario = scenario
         self.mode = mode
         self.max_steps = max_steps
+        self.seed = scenario.seed if seed is None else seed
+        self.rng = Random(self.seed)
         self.state = State([], [], 0)
-        self.done = False
+        self.terminated = False
+        self.truncated = False
 
     def reset(self) -> dict:
         # Recreate agent positions so a new episode starts from the generated layout.
         self.state = State(list(self.scenario.pursuers), list(self.scenario.evaders), 0)
-        self.done = False
+        self.rng = Random(self.seed)
+        self.terminated = False
+        self.truncated = False
         return self.observe()
+
+    @property
+    def done(self) -> bool:
+        return self.terminated or self.truncated
 
     def observe(self) -> dict:
         # Expose immutable tuples for positions while retaining scenario objects.
+        agent_observations = {
+            "pursuers": tuple(self._agent_observation(position, "pursuer") for position in self.state.pursuers),
+            "evaders": tuple(self._agent_observation(position, "evader") for position in self.state.evaders),
+        }
         return {
             "pursuers": tuple(self.state.pursuers),
             "evaders": tuple(self.state.evaders),
@@ -43,6 +54,47 @@ class PursuitEvasionEnv:
             "walls": self.scenario.walls,
             "goals": self.scenario.goals,
             "step": self.state.step_count,
+            "observations": agent_observations,
+            "global_state": self._global_state(),
+            "action_masks": self._action_masks(),
+        }
+
+    def _global_state(self) -> tuple[int, ...]:
+        # Encode a fixed-size state: pursuers, evaders, barrels, goals, then walls.
+        state: list[int] = []
+        for row in range(self.scenario.rows):
+            for col in range(self.scenario.cols):
+                position = (row, col)
+                state.extend((
+                    int(position in self.state.pursuers),
+                    int(position in self.state.evaders),
+                    int(position in self.scenario.barrels),
+                    int(position in self.scenario.goals),
+                ))
+                state.extend(int((position, direction) in self.scenario.walls) for direction in ("up", "down", "left", "right"))
+        return tuple(state)
+
+    def _valid_actions(self, position: Position, speed: int) -> tuple[bool, ...]:
+        return tuple(action == "stay" or self._move(position, action, speed) != position for action in ACTION_ORDER)
+
+    def _action_masks(self) -> dict[str, tuple[tuple[bool, ...], ...]]:
+        return {
+            "pursuers": tuple(self._valid_actions(position, self.scenario.pursuer_speed) for position in self.state.pursuers),
+            "evaders": tuple(self._valid_actions(position, self.scenario.evader_speed) for position in self.state.evaders),
+        }
+
+    def _agent_observation(self, position: Position, role: str) -> dict:
+        speed = self.scenario.pursuer_speed if role == "pursuer" else self.scenario.evader_speed
+        return {
+            "role": role,
+            "position": position,
+            "pursuers": tuple(self.state.pursuers),
+            "evaders": tuple(self.state.evaders),
+            "barrels": self.scenario.barrels,
+            "walls": self.scenario.walls,
+            "goals": self.scenario.goals,
+            "step": self.state.step_count,
+            "action_mask": self._valid_actions(position, speed),
         }
 
     def _wall_blocks(self, position: Position, action: Action) -> bool:
@@ -81,7 +133,7 @@ class PursuitEvasionEnv:
         for proposed in dict.fromkeys(proposed_positions):
             # A random contender wins a shared destination instead of list order deciding.
             contenders = [index for index, position in enumerate(proposed_positions) if position == proposed]
-            winner = contenders[0] if len(contenders) == 1 else COLLISION_RANDOM.choice(contenders)
+            winner = contenders[0] if len(contenders) == 1 else self.rng.choice(contenders)
             if proposed not in occupied:
                 resolved_positions[winner] = proposed
                 occupied.add(proposed)
@@ -96,7 +148,7 @@ class PursuitEvasionEnv:
             occupied.add(alternative)
         return [position for position in resolved_positions if position is not None]
 
-    def step(self, pursuer_actions: list[Action], evader_actions: list[Action]) -> tuple[dict, dict, bool, dict]:
+    def step(self, pursuer_actions: list[Action], evader_actions: list[Action]) -> tuple[dict, dict, bool, bool, dict]:
         # Advance pursuers first, then block direct pursuer-evader endpoint swaps.
         if self.done:
             raise RuntimeError("The episode is complete; call reset() before stepping again.")
@@ -123,9 +175,16 @@ class PursuitEvasionEnv:
         captured = any(evader in self.state.pursuers for evader in self.state.evaders)
         reached_goal = self.mode in GOAL_MODES and any(evader in self.scenario.goals for evader in self.state.evaders)
         timed_out = self.state.step_count >= self.max_steps
-        self.done = captured or reached_goal or timed_out
-        # Both teams receive shared group rewards with a small non-terminal step cost.
+        self.terminated = captured or reached_goal
+        self.truncated = timed_out and not self.terminated
+        # Survival is the evader's objective, including surviving until the horizon.
         pursuer_reward = 1.0 if captured else (-0.01 if not self.done else 0.0)
-        evader_reward = -1.0 if captured else (1.0 if reached_goal else -0.01)
-        info = {"captured": captured, "reached_goal": reached_goal, "time": self.state.step_count}
-        return self.observe(), {"pursuers": pursuer_reward, "evaders": evader_reward}, self.done, info
+        evader_reward = -1.0 if captured else (1.0 if reached_goal or self.truncated else -0.01)
+        info = {
+            "captured": captured,
+            "reached_goal": reached_goal,
+            "time": self.state.step_count,
+            "terminated": self.terminated,
+            "truncated": self.truncated,
+        }
+        return self.observe(), {"pursuers": pursuer_reward, "evaders": evader_reward}, self.terminated, self.truncated, info
