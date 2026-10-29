@@ -2,7 +2,7 @@ from collections import deque
 from dataclasses import dataclass
 from time import perf_counter
 
-from env.level_generator import Position, Scenario
+from env.scenario_generator import Position, Scenario
 
 ACTIONS = ((-1, 0, "up"), (1, 0, "down"), (0, -1, "left"), (0, 1, "right"))
 OPPOSITE_ACTION = {"up": "down", "down": "up", "left": "right", "right": "left"}
@@ -18,7 +18,7 @@ def _neighbors(position: Position, scenario: Scenario):
         candidate = (position[0] + row_delta, position[1] + col_delta)
         inside_grid = 0 <= candidate[0] < scenario.rows and 0 <= candidate[1] < scenario.cols
         blocked_by_wall = _wall_blocks(position, candidate, action, scenario)
-        if inside_grid and candidate not in scenario.obstacles and not blocked_by_wall:
+        if inside_grid and candidate not in scenario.barrels and not blocked_by_wall:
             yield candidate, action
 
 

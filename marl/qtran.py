@@ -8,4 +8,5 @@ class QTRANMixer(QMIXMixer):
 
     def forward(self, values: Tensor, state: Tensor) -> Tensor:
         mixed = super().forward(values, state)
-        return mixed + values.mean(dim=-1, keepdim=True)
+        correction = values.mean(dim=1, keepdim=True)
+        return mixed + correction

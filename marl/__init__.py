@@ -1,5 +1,4 @@
 from .base import AgentNetwork, TrainingResult
-from .iql import IQLMixer
 from .qmix import QMIXMixer
 from .qplex import QPLEXMixer
 from .qtran import QTRANMixer
@@ -8,7 +7,6 @@ from .vdn import VDNMixer
 
 __all__ = [
     "AgentNetwork",
-    "IQLMixer",
     "QMIXMixer",
     "QPLEXMixer",
     "QTRANMixer",

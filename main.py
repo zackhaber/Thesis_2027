@@ -1,61 +1,116 @@
+"""
+main.py
+
+Central command-line interface and entry point for the Multi-Agent Pursuit-Evasion suite.
+Dispatches subcommands for GUI visual rollouts, benchmark evaluations, MARL training, and notebooks.
+"""
+
 import argparse
 import json
 import subprocess
 import sys
-
 from notebooks import run_classical_suite
 from ui import run_gui
 
+
 def build_parser() -> argparse.ArgumentParser:
-    # Define the command-line entry points and their experiment-specific options.
-    parser = argparse.ArgumentParser(description="Run the pursuit-evasion experiments.")
+    """Builds the command-line interface subcommands and options."""
+    parser = argparse.ArgumentParser(
+        description="Run multi-agent pursuit-evasion benchmarks and training pipelines."
+    )
     subparsers = parser.add_subparsers(dest="command")
 
-    demo = subparsers.add_parser("demo", help="Display a generated environment.")
-    demo.add_argument("--level", type=int, choices=(1, 2, 3), default=1)
-    demo.add_argument("--seed", type=int, default=7)
+    # 1. GUI Visual Rollout Demo
+    demo = subparsers.add_parser("demo", help="Display the interactive GUI visual rollout.")
+    demo.add_argument("--seed", type=int, default=7, help="Random seed for scenario generation.")
 
-    benchmark = subparsers.add_parser("benchmark", help="Run the classical planner benchmark.")
-    benchmark.add_argument("--levels", type=int, nargs="+", choices=(1, 2, 3), default=(1, 2, 3))
+    # 2. Classical Planners Benchmark Suite
+    benchmark = subparsers.add_parser("benchmark", help="Run the classical planner benchmark suite.")
+    benchmark.add_argument("--grid-size", type=int, default=20)
+    benchmark.add_argument("--wall-density", type=float, default=0.5)
+    benchmark.add_argument("--barrel-density", type=float, default=0.1)
+    benchmark.add_argument("--seeds", type=int, nargs="+", default=(7,))
 
-    train = subparsers.add_parser("train", help="Run a lightweight MARL training baseline.")
-    train.add_argument("--algorithm", choices=("IQL", "VDN", "QMIX", "QTRAN", "QPLEX"), default="VDN")
+    # 3. Offline MARL Model Training
+    train = subparsers.add_parser("train", help="Run MARL training pipeline and export model weights.")
+    train.add_argument("--algorithm", choices=("IQL", "VDN", "QMIX", "QTRAN", "QPLEX"), default="QMIX")
     train.add_argument("--episodes", type=int, default=100)
     train.add_argument("--seed", type=int, default=7)
+    train.add_argument("--grid-size", type=int, default=20)
+    train.add_argument("--pursuers", type=int, default=4)
+    train.add_argument("--wall-density", type=float, default=0.75)
+    train.add_argument("--barrel-density", type=float, default=0.0)
+    train.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save .pt weights.")
 
-    notebook = subparsers.add_parser("notebook", help="Open the project notebooks in Jupyter.")
-    notebook.add_argument("--path", default="notebooks")
+    # 4. Jupyter Notebook Launcher
+    notebook = subparsers.add_parser("notebook", help="Open project notebooks in Jupyter.")
+    notebook.add_argument("--path", default=".")
     return parser
 
 
 def main() -> int:
-    # Dispatch the selected command to the corresponding project driver.
+    """Dispatches CLI commands to project modules."""
     parser = build_parser()
     args = parser.parse_args()
 
     if args.command == "demo":
-        run_gui(args.level, args.seed)
+        run_gui(args.seed)
         return 0
+
     if args.command == "benchmark":
-        print(json.dumps(run_classical_suite(args.levels), indent=2))
+        results = run_classical_suite(
+            grid_size=args.grid_size,
+            wall_density=args.wall_density,
+            barrel_density=args.barrel_density,
+            seeds=tuple(args.seeds),
+        )
+        print(json.dumps(results, indent=2))
         return 0
+
     if args.command == "train":
         try:
             from marl import build_agent
         except ModuleNotFoundError as error:
             if error.name == "torch":
-                parser.error("PyTorch is required for training. Install it with: python -m pip install torch")
+                parser.error("PyTorch is required for training. Install it with: pip install torch")
             raise
-        result = build_agent(args.algorithm, args.seed).train(args.episodes)
-        print(json.dumps({"algorithm": result.algorithm, "episodes": len(result.rewards), "final_reward": result.rewards[-1], "final_loss": result.losses[-1]}, indent=2))
+
+        # Initialize trainer with explicit checkpoint directory
+        trainer = build_agent(
+            args.algorithm,
+            seed=args.seed,
+            checkpoint_dir=args.checkpoint_dir,
+            grid_size=args.grid_size,
+            pursuers=args.pursuers,
+            wall_density=args.wall_density,
+            barrel_density=args.barrel_density,
+        )
+        result = trainer.train(args.episodes)
+
+        summary = {
+            "algorithm": result.algorithm,
+            "seed": args.seed,
+            "episodes": len(result.rewards),
+            "final_reward": round(result.rewards[-1], 2) if result.rewards else 0.0,
+            "final_loss": round(result.losses[-1], 4) if result.losses else 0.0,
+            "checkpoint": result.checkpoint,
+            "best_checkpoint": result.best_checkpoint,
+            "final_evaluation_capture_rate": (
+                result.evaluation_capture_rates[-1]
+                if result.evaluation_capture_rates
+                else None
+            ),
+        }
+        print(json.dumps(summary, indent=2))
         return 0
+
     if args.command == "notebook":
         return subprocess.call([sys.executable, "-m", "jupyter", "notebook", args.path])
 
+    # Default fallback: Launch the interactive Tkinter application
     run_gui()
     return 0
 
 
 if __name__ == "__main__":
-    # Route command-line choices to the existing experiment drivers.
     raise SystemExit(main())

@@ -2,7 +2,7 @@ from collections import deque
 from itertools import product
 from time import perf_counter
 
-from env.level_generator import Position, Scenario
+from env.scenario_generator import Position, Scenario
 from .cbs import _neighbors
 
 

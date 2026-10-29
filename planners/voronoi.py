@@ -1,6 +1,6 @@
 from time import perf_counter
 
-from env.level_generator import Position, Scenario
+from env.scenario_generator import Position, Scenario
 from .cbs import _neighbors
 
 
@@ -10,7 +10,7 @@ def _step_towards(start, target, scenario):
     valid = []
     for action, (row_delta, col_delta) in options:
         candidate = (start[0] + row_delta, start[1] + col_delta)
-        if 0 <= candidate[0] < scenario.rows and 0 <= candidate[1] < scenario.cols and candidate not in scenario.obstacles:
+        if 0 <= candidate[0] < scenario.rows and 0 <= candidate[1] < scenario.cols and candidate not in scenario.barrels:
             distance = abs(candidate[0] - target[0]) + abs(candidate[1] - target[1])
             valid.append((distance, action))
     return min(valid)[1] if valid else "stay"

@@ -2,13 +2,11 @@ from dataclasses import asdict, dataclass
 from statistics import mean, stdev
 from time import perf_counter
 from typing import Callable
-
-from env import DifficultySpec, PursuitEvasionEnv, generate_level
+from env import PursuitEvasionEnv, ScenarioSpec, generate_scenario
 from env.env import Action
 from env.game_modes import GameMode
 
 Policy = Callable[[dict], tuple[list[Action], list[Action]]]
-
 
 @dataclass(frozen=True)
 class RolloutResult:
@@ -18,7 +16,6 @@ class RolloutResult:
     time_to_event: int
     path_efficiency: float
     compute_seconds: float
-
 
 def rollout(policy: Policy, environment: PursuitEvasionEnv) -> RolloutResult:
     observation = environment.reset()
@@ -46,7 +43,6 @@ def rollout(policy: Policy, environment: PursuitEvasionEnv) -> RolloutResult:
     path_efficiency = initial_distance / max(distance_travelled, initial_distance, 1)
     return RolloutResult(captured, bool(info["reached_goal"]), truncated, info["time"], path_efficiency, compute_seconds)
 
-
 def confidence_interval(values: list[float]) -> tuple[float, float]:
     if len(values) < 2:
         value = values[0] if values else 0.0
@@ -55,8 +51,8 @@ def confidence_interval(values: list[float]) -> tuple[float, float]:
     return mean(values) - margin, mean(values) + margin
 
 
-def evaluate_policy(policy: Policy, specs: list[DifficultySpec], mode: GameMode = GameMode.MAZE) -> dict:
-    results = [rollout(policy, PursuitEvasionEnv(generate_level(spec, mode), mode)) for spec in specs]
+def evaluate_policy(policy: Policy, specs: list[ScenarioSpec], mode: GameMode = GameMode.MAZE) -> dict:
+    results = [rollout(policy, PursuitEvasionEnv(generate_scenario(spec, mode), mode)) for spec in specs]
     capture_rate = mean(result.captured for result in results) if results else 0.0
     capture_interval = confidence_interval([float(result.captured) for result in results])
     return {
