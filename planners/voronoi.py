@@ -3,7 +3,6 @@ from time import perf_counter
 from env.scenario_generator import Position, Scenario
 from .cbs import _neighbors
 
-
 def _step_towards(start, target, scenario):
     # Greedily choose the valid neighboring cell with minimum Manhattan distance.
     options = [(action, delta) for candidate, action in _neighbors(start, scenario) for delta in [(candidate[0] - start[0], candidate[1] - start[1])]]
@@ -29,6 +28,14 @@ def _advance(position: Position, action: str, scenario: Scenario) -> Position:
 def voronoi_plan(scenario: Scenario) -> dict:
     # Roll out the greedy controller for a bounded number of grid steps.
     started = perf_counter()
+    if not scenario.evaders:
+        return {
+            "algorithm": "Voronoi",
+            "paths": [[] for _ in scenario.pursuers],
+            "planning_time": perf_counter() - started,
+            "success": False,
+            "owner": None,
+        }
     target = scenario.evaders[0]
     owner = min(range(len(scenario.pursuers)), key=lambda index: (
         abs(scenario.pursuers[index][0] - target[0])

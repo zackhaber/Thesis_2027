@@ -20,33 +20,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    # 1. GUI Visual Rollout Demo
+    # GUI Visual Rollout Demo
     demo = subparsers.add_parser("demo", help="Display the interactive GUI visual rollout.")
-    demo.add_argument("--seed", type=int, default=7, help="Random seed for scenario generation.")
+    demo.add_argument("--seed", type=int, default=0, help="Random seed for scenario generation.")
 
-    # 2. Classical Planners Benchmark Suite
+    # Classical Planners Benchmark Suite khghgkg
     benchmark = subparsers.add_parser("benchmark", help="Run the classical planner benchmark suite.")
     benchmark.add_argument("--grid-size", type=int, default=20)
     benchmark.add_argument("--wall-density", type=float, default=0.5)
     benchmark.add_argument("--barrel-density", type=float, default=0.1)
-    benchmark.add_argument("--seeds", type=int, nargs="+", default=(7,))
+    benchmark.add_argument("--seeds", type=int, nargs="+", default=(0,))
 
-    # 3. Offline MARL Model Training
+    # Offline MARL Model Training
     train = subparsers.add_parser("train", help="Run MARL training pipeline and export model weights.")
     train.add_argument("--algorithm", choices=("IQL", "VDN", "QMIX", "QTRAN", "QPLEX"), default="QMIX")
     train.add_argument("--episodes", type=int, default=100)
-    train.add_argument("--seed", type=int, default=7)
+    train.add_argument("--seed", type=int, default=0)
     train.add_argument("--grid-size", type=int, default=20)
     train.add_argument("--pursuers", type=int, default=4)
     train.add_argument("--wall-density", type=float, default=0.75)
     train.add_argument("--barrel-density", type=float, default=0.0)
     train.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save .pt weights.")
 
-    # 4. Jupyter Notebook Launcher
+    # Jupyter Notebook Launcher
     notebook = subparsers.add_parser("notebook", help="Open project notebooks in Jupyter.")
     notebook.add_argument("--path", default=".")
     return parser
-
 
 def main() -> int:
     """Dispatches CLI commands to project modules."""

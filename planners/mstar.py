@@ -37,12 +37,16 @@ def _valid_joint_move(
         for second in range(first + 1, len(current))
     )
 
-
 def mstar_plan(scenario: Scenario) -> dict:
     """Plan with decoupled BFS routes and joint expansion only at collisions."""
     started = perf_counter()
     if not scenario.evaders:
-        return {"algorithm": "M*", "paths": [], "planning_time": 0.0, "success": False}
+        return {
+            "algorithm": "M*",
+            "paths": [[] for _ in scenario.pursuers],
+            "planning_time": perf_counter() - started,
+            "success": False,
+        }
     target = scenario.evaders[0]
     distance_maps = [_distance_map(target, scenario) for _ in scenario.pursuers]
     starts = tuple(scenario.pursuers)

@@ -13,7 +13,7 @@ def run_classical_suite(
     grid_size: int = 20,
     wall_density: float = 0.5,
     barrel_density: float = 0.1,
-    seeds: tuple[int, ...] = (7,),
+    seeds: tuple[int, ...] = (0,),
 ) -> list[dict]:
     """Evaluate each classical planner on the requested deterministic scenarios."""
     rows: list[dict] = []

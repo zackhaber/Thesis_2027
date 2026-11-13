@@ -43,7 +43,7 @@ class ScenarioSpec:
     barrel_density: float = 0.1
     wall_density: float = 0.5
     goals: int = 1
-    seed: int = 7
+    seed: int = 0
 
 # Immutable finished board layout passed into the environment.
 @dataclass(frozen=True)

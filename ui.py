@@ -6,7 +6,7 @@ Integrates Visual Rollouts, Batch Benchmarks, and Offline MARL Model Training.
 """
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 from collections import deque
 from dataclasses import replace
 from pathlib import Path
@@ -18,8 +18,20 @@ from typing import cast
 from env import PursuitEvasionEnv, ScenarioSpec, generate_scenario
 from env.env import Action
 from env.game_modes import GameMode
+from env.knowledge import (
+    EvaderBelief,
+    KnowledgeMode,
+    Perception,
+    PursuerBelief,
+    explore_action,
+    planner_view,
+    target_action,
+)
+from evader_policy import evader_action
 from marl.trainer import TorchMixer
+from marl.base import AgentNetwork, belief_action_masks, belief_state_tensor, state_tensor
 from planners import cbs_plan, mstar_plan, voronoi_plan
+from search.viper_adapter import ViperSearcher
 
 Position = tuple[int, int]
 MOVEMENT_ACTIONS: tuple[Action, ...] = ("up", "down", "left", "right")
@@ -46,6 +58,10 @@ COLOR_ERROR = "#fca5a5"
 COLOR_SUCCESS = "#22c55e"
 COLOR_FAILURE = "#f87171"
 COLOR_ACCENT = "#2563eb"
+DEFAULT_PURSUER_COUNT = 4
+UNKNOWN_MAX_STEPS_MULTIPLIER = 4
+_MARL_POLICY_CACHE: dict[Path, AgentNetwork] = {}
+_MARL_PAYLOAD_CACHE: dict[Path, dict] = {}
 
 
 # Board and Navigation Helpers
@@ -143,26 +159,8 @@ def _evader_action(
     evader: Position,
     pursuer_positions: set[Position],
 ) -> Action:
-    """Computes evasive step avoiding pursuers while advancing toward goals."""
-    goal_mode = environment.mode in (GameMode.REACH_AVOID, GameMode.MAZE)
-
-    if goal_mode:
-        nearest_goal = _nearest_target(evader, environment.scenario.goals)
-        safe_action = _first_step_to_target(environment, evader, nearest_goal, pursuer_positions)
-        if safe_action is not None:
-            return safe_action
-
-    legal = _legal_actions(environment, evader)
-    if not legal:
-        return MOVEMENT_ACTIONS[0]
-
-    def score_action(action: Action) -> tuple[int, int]:
-        new_pos = _position_after_action(environment, evader, action)
-        safety = min(_distance(new_pos, p) for p in pursuer_positions)
-        goal_bonus = -_distance(new_pos, _nearest_target(evader, environment.scenario.goals)) if goal_mode else 0
-        return (safety, goal_bonus)
-
-    return max(legal, key=score_action)
+    """Computes evasive movement through the shared policy implementation."""
+    return evader_action(environment, evader, pursuer_positions)
 
 
 def _planner_scenario(environment: PursuitEvasionEnv):
@@ -174,41 +172,159 @@ def _planner_scenario(environment: PursuitEvasionEnv):
     )
 
 
+def _resolve_checkpoint_path(
+    algorithm: str,
+    training_seed: int,
+    grid_size: int,
+    pursuer_count: int,
+    checkpoint_dir: Path = Path("checkpoints"),
+    knowledge: KnowledgeMode = KnowledgeMode.KNOWN,
+) -> Path | None:
+    """Resolves the best available checkpoint for one MARL configuration."""
+    del grid_size, pursuer_count
+    knowledge_suffix = f"_{knowledge.value}" if knowledge == KnowledgeMode.UNKNOWN else ""
+    stem = f"{algorithm.lower()}{knowledge_suffix}_{training_seed}"
+    best = checkpoint_dir / f"{stem}_best.pt"
+    plain = checkpoint_dir / f"{stem}.pt"
+    return best if best.exists() else plain if plain.exists() else None
+
+
+def _checkpoint_configuration_warning(
+    checkpoint_path: Path,
+    evaluation_mode: GameMode,
+    wall_density: float,
+    barrel_density: float,
+    knowledge: KnowledgeMode = KnowledgeMode.KNOWN,
+) -> str | None:
+    """Describes evaluation settings that differ from checkpoint metadata."""
+    payload = _load_marl_payload(checkpoint_path)
+    differences: list[str] = []
+    checkpoint_knowledge = payload.get("knowledge_mode", KnowledgeMode.KNOWN.value)
+    if checkpoint_knowledge != knowledge.value:
+        differences.append(f"knowledge {checkpoint_knowledge} vs {knowledge.value}")
+    training_mode = payload.get("training_mode")
+    if training_mode is None:
+        differences.append("training mode is unavailable")
+    elif training_mode != evaluation_mode.value:
+        differences.append(f"mode {training_mode} vs {evaluation_mode.value}")
+    evader_policy = payload.get("evader_policy")
+    if evader_policy is None:
+        differences.append("evader behaviour is unavailable")
+    elif evader_policy != "scripted_flee":
+        differences.append(f"evader {evader_policy} vs scripted_flee")
+    trained_walls = payload.get("training_wall_density")
+    trained_barrels = payload.get("training_barrel_density")
+    if trained_walls is None or trained_barrels is None:
+        differences.append("density settings are unavailable")
+    else:
+        if float(trained_walls) != wall_density:
+            differences.append(f"walls {trained_walls} vs {wall_density}")
+        if float(trained_barrels) != barrel_density:
+            differences.append(f"barrels {trained_barrels} vs {barrel_density}")
+    return (
+        "Checkpoint training configuration differs: " + "; ".join(differences)
+        if differences
+        else None
+    )
+
+
+def _load_marl_payload(checkpoint_path: Path) -> dict:
+    """Loads and caches checkpoint metadata."""
+    if checkpoint_path not in _MARL_PAYLOAD_CACHE:
+        import torch
+
+        _MARL_PAYLOAD_CACHE[checkpoint_path] = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=False
+        )
+    return _MARL_PAYLOAD_CACHE[checkpoint_path]
+
+
+def _load_marl_policy(checkpoint_path: Path) -> tuple[AgentNetwork, dict]:
+    """Loads and caches a MARL policy and its checkpoint metadata."""
+    payload = _load_marl_payload(checkpoint_path)
+    if checkpoint_path not in _MARL_POLICY_CACHE:
+        policy = AgentNetwork(int(payload["state_size"]), int(payload["agent_count"]))
+        policy.load_state_dict(payload["agents"])
+        policy.eval()
+        _MARL_POLICY_CACHE[checkpoint_path] = policy
+    return _MARL_POLICY_CACHE[checkpoint_path], _MARL_PAYLOAD_CACHE[checkpoint_path]
+
+
 def _marl_pursuer_actions(
     environment: PursuitEvasionEnv,
     algorithm: str,
-) -> tuple[list[Action], bool]:
-    """Loads PyTorch checkpoint and returns pursuer actions plus checkpoint status."""
-    checkpoint = Path("checkpoints") / f"{algorithm.lower()}_{environment.scenario.seed}_best.pt"
-    if not checkpoint.exists():
-        checkpoint = Path("checkpoints") / f"{algorithm.lower()}_{environment.scenario.seed}.pt"
-    if not checkpoint.exists():
-        return [_pursuer_action(environment, p) for p in environment.state.pursuers], False
+    checkpoint_path: Path | None = None,
+    knowledge_mode: KnowledgeMode = KnowledgeMode.KNOWN,
+    perception: Perception | None = None,
+) -> tuple[list[Action], bool, str | None]:
+    """Returns MARL pursuer actions, status, and an optional checkpoint diagnostic."""
+    if knowledge_mode == KnowledgeMode.UNKNOWN:
+        if perception is None:
+            return ["stay"] * len(environment.state.pursuers), False, "Unknown MARL evaluation requires a perception belief."
+        fallback = [
+            explore_action(perception.pursuer_belief, position)
+            for position in perception.pursuer_belief.pursuer_positions
+        ]
+    else:
+        fallback = [_pursuer_action(environment, p) for p in environment.state.pursuers]
+    if checkpoint_path is None:
+        return fallback, False, "No checkpoint was resolved for this configuration."
 
     import torch
-    from marl.base import AgentNetwork, state_tensor
-
     observation = environment.observe()
-    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    agent_count = int(payload.get("agent_count", len(observation["pursuers"])))
-    if agent_count != len(observation["pursuers"]):
-        return [_pursuer_action(environment, p) for p in environment.state.pursuers], False
-    policy = AgentNetwork(len(observation["global_state"]), agent_count)
-    policy.load_state_dict(payload["agents"])
-    policy.eval()
+    try:
+        payload = _load_marl_payload(checkpoint_path)
+    except (KeyError, RuntimeError, TypeError, ValueError) as error:
+        return fallback, False, f"Checkpoint could not be loaded: {error}"
+    if not isinstance(payload, dict):
+        return fallback, False, "Checkpoint mismatch: payload is not a metadata dictionary."
 
+    expected_state_size = (
+        environment.scenario.rows * environment.scenario.cols * 9
+        if knowledge_mode == KnowledgeMode.UNKNOWN
+        else len(observation["global_state"])
+    )
+    expected_agent_count = len(observation["pursuers"])
+    expected_grid_size = environment.scenario.rows
+    metadata = (
+        ("state_size", payload.get("state_size"), expected_state_size),
+        ("agent_count", payload.get("agent_count"), expected_agent_count),
+        ("grid_size", payload.get("grid_size"), expected_grid_size),
+        ("knowledge_mode", payload.get("knowledge_mode", KnowledgeMode.KNOWN.value), knowledge_mode.value),
+    )
+    for name, actual, expected in metadata:
+        if actual != expected:
+            return (
+                fallback,
+                False,
+                f"Checkpoint mismatch: {name} is {actual}, expected {expected}.",
+            )
+    try:
+        policy, _ = _load_marl_policy(checkpoint_path)
+    except (KeyError, RuntimeError, TypeError, ValueError) as error:
+        return fallback, False, f"Checkpoint could not be loaded: {error}"
+
+    if knowledge_mode == KnowledgeMode.UNKNOWN:
+        state = belief_state_tensor(perception.pursuer_belief, environment)
+        masks = torch.tensor(
+            belief_action_masks(perception.pursuer_belief, environment),
+            dtype=torch.bool,
+        )
+    else:
+        state = state_tensor(observation)
+        masks = torch.tensor(observation["action_masks"]["pursuers"], dtype=torch.bool)
     with torch.no_grad():
         values = policy(
-            state_tensor(observation).repeat(agent_count, 1),
-            torch.arange(agent_count),
+            state.repeat(expected_agent_count, 1),
+            torch.arange(expected_agent_count),
         )
 
     actions: list[Action] = []
-    for index, mask in enumerate(observation["action_masks"]["pursuers"]):
+    for index, mask in enumerate(masks):
         masked = values[index].clone()
-        masked[~torch.tensor(mask, dtype=torch.bool)] = -torch.inf
+        masked[~mask] = -torch.inf
         actions.append(ACTION_NAMES[int(masked.argmax())])
-    return actions, True
+    return actions, True, None
 
 
 def _planner_action(value: object, fallback: Action) -> Action:
@@ -220,22 +336,48 @@ def _planner_action(value: object, fallback: Action) -> Action:
 def _autonomous_actions(
     environment: PursuitEvasionEnv,
     algorithm: str = "CBS",
-) -> tuple[list[Action], list[Action], bool]:
+    checkpoint_path: Path | None = None,
+    knowledge_mode: KnowledgeMode = KnowledgeMode.KNOWN,
+    perception: Perception | None = None,
+    viper_searcher: ViperSearcher | None = None,
+    switch_on_detection: bool = True,
+) -> tuple[list[Action], list[Action], bool, str | None]:
     """Computes coordinated timestep moves for all agents."""
+    if knowledge_mode == KnowledgeMode.UNKNOWN:
+        if perception is None:
+            perception = Perception()
+        if viper_searcher is not None:
+            sensor = replace(perception.sensor, radius=viper_searcher.sensor_radius_cells)
+            perception.sensor = sensor
+            perception.pursuer_belief.sensor = sensor
+            perception.evader_belief.sensor = sensor
+        perception.update(environment)
+        return _unknown_actions(
+            environment,
+            algorithm,
+            perception,
+            checkpoint_path,
+            viper_searcher,
+            switch_on_detection,
+        )
+
     is_trained = True
+    checkpoint_message: str | None = None
     pursuer_actions: list[Action]
     if algorithm in {"CBS", "M*", "Voronoi"}:
         planner = {"CBS": cbs_plan, "M*": mstar_plan, "Voronoi": voronoi_plan}[algorithm]
         result = planner(_planner_scenario(environment))
-        pursuer_actions = [
-            _planner_action(
-                path[0] if path else None,
-                _pursuer_action(environment, p),
+        pursuer_actions = []
+        for index, pursuer in enumerate(environment.state.pursuers):
+            paths = result["paths"]
+            path = paths[index] if index < len(paths) else []
+            pursuer_actions.append(
+                _planner_action(path[0] if path else None, _pursuer_action(environment, pursuer))
             )
-            for p, path in zip(environment.state.pursuers, result["paths"])
-        ]
     else:
-        pursuer_actions, is_trained = _marl_pursuer_actions(environment, algorithm)
+        pursuer_actions, is_trained, checkpoint_message = _marl_pursuer_actions(
+            environment, algorithm, checkpoint_path
+        )
 
     predicted_positions: set[Position] = set()
     for pursuer, action in zip(environment.state.pursuers, pursuer_actions):
@@ -248,25 +390,106 @@ def _autonomous_actions(
         for evader in environment.state.evaders
     ]
 
-    return pursuer_actions, evader_actions, is_trained
+    return pursuer_actions, evader_actions, is_trained, checkpoint_message
+
+
+def _unknown_actions(
+    environment: PursuitEvasionEnv,
+    algorithm: str,
+    perception: Perception,
+    checkpoint_path: Path | None = None,
+    viper_searcher: ViperSearcher | None = None,
+    switch_on_detection: bool = True,
+) -> tuple[list[Action], list[Action], bool, str | None]:
+    """Selects actions from partial beliefs without changing Known behavior."""
+    pursuer_belief = perception.pursuer_belief
+    evader_belief = perception.evader_belief
+    if algorithm in MARL_ALGORITHMS:
+        pursuer_actions, is_trained, checkpoint_message = _marl_pursuer_actions(
+            environment,
+            algorithm,
+            checkpoint_path,
+            KnowledgeMode.UNKNOWN,
+            perception,
+        )
+    elif (
+        viper_searcher is not None
+        and (pursuer_belief.visible_evaders or pursuer_belief.last_seen_evader)
+    ):
+        viper_searcher.selected_algorithm = algorithm
+        viper_searcher.switch_on_detection = switch_on_detection
+        viper_searcher.set_environment(environment)
+        pursuer_actions = viper_searcher.act(
+            pursuer_belief,
+            pursuer_belief.pursuer_positions,
+        )
+    elif pursuer_belief.visible_evaders or pursuer_belief.last_seen_evader:
+        view = planner_view(pursuer_belief, environment)
+        planner = {"CBS": cbs_plan, "M*": mstar_plan, "Voronoi": voronoi_plan}[algorithm]
+        result = planner(view)
+        pursuer_actions = []
+        for index, position in enumerate(pursuer_belief.pursuer_positions):
+            paths = result["paths"]
+            path = paths[index] if index < len(paths) else []
+            pursuer_actions.append(
+                _planner_action(path[0], explore_action(pursuer_belief, position))
+                if path
+                else explore_action(pursuer_belief, position)
+            )
+    else:
+        pursuer_actions = [
+            explore_action(pursuer_belief, position)
+            for position in pursuer_belief.pursuer_positions
+        ]
+
+    evader_actions = []
+    for position in environment.state.evaders:
+        if evader_belief.known_goals:
+            goal = min(
+                evader_belief.known_goals,
+                key=lambda candidate: abs(position[0] - candidate[0]) + abs(position[1] - candidate[1]),
+            )
+            evader_actions.append(
+                target_action(evader_belief, position, goal, evader_belief.visible_pursuers)
+            )
+        else:
+            evader_actions.append(
+                explore_action(
+                    evader_belief,
+                    position,
+                    evader_belief.visible_pursuers,
+                )
+            )
+    if algorithm in MARL_ALGORITHMS:
+        return pursuer_actions, evader_actions, is_trained, checkpoint_message
+    return pursuer_actions, evader_actions, False, None
 
 
 # Application Interface
 class PursuitEvasionApp:
     """Main application supporting visual rollouts, batch benchmarks, and MARL training."""
 
-    def __init__(self, seed: int = 7):
+    def __init__(self, seed: int = 0):
         self.seed = seed
         self.mode = GameMode.PURE_PURSUIT
         self.algorithm = "CBS"
         self.custom_grid_size = 20
         self.custom_wall_density = 0.5
         self.custom_barrel_density = 0.1
+        self.knowledge = KnowledgeMode.KNOWN
+        self.switch_on_detection = True
+        self.viper_searcher = ViperSearcher(selected_algorithm=self.algorithm)
+        self.show_ground_truth = False
 
         self.environment: PursuitEvasionEnv | None = None
+        self.perception: Perception | None = None
+        self.detection_step: int | None = None
+        self.checkpoint_path: Path | None = None
+        self.checkpoint_message: str | None = None
         self.running = False
         self.paused = False
         self.is_checkpoint_active = False
+        self._simulation_generation = 0
 
         self.started_at = 0.0
         self.elapsed = 0.0
@@ -325,6 +548,7 @@ class PursuitEvasionApp:
     def show_main_menu(self) -> None:
         """Renders main navigation hub."""
         self.running = False
+        self._simulation_generation += 1
         self._clear()
         frame = self._frame()
         self._title(frame, "Multi-Agent Strategies for\n Pursuit-Evasion Games", "By Zack Haber")
@@ -351,6 +575,14 @@ class PursuitEvasionApp:
         self.config_family.set("Planner")
         self.config_family.grid(row=1, column=1, padx=10, pady=5)
         self.config_family.bind("<<ComboboxSelected>>", lambda *_: self._update_config_algorithms())
+
+        add_label(7, "Environment Knowledge")
+        self.config_knowledge = ttk.Combobox(
+            form, values=("Known", "Unknown (Search)"), state="readonly", width=25
+        )
+        self.config_knowledge.set("Known")
+        self.config_knowledge.grid(row=7, column=1, padx=10, pady=5)
+        self.config_knowledge.bind("<<ComboboxSelected>>", lambda *_: self._update_config_algorithms())
 
         add_label(2, "Algorithm")
         self.config_algorithm = ttk.Combobox(form, values=CLASSICAL_ALGORITHMS, state="readonly", width=25)
@@ -390,10 +622,17 @@ class PursuitEvasionApp:
         self.config_barrels.grid(row=6, column=1, padx=10, pady=5)
 
         if simulation:
-            add_label(7, "Number of Simulations")
+            add_label(8, "Number of Simulations")
             self.batch_runs = ttk.Entry(form, width=28, justify="center")
             self.batch_runs.insert(0, "10")
-            self.batch_runs.grid(row=7, column=1, padx=10, pady=5)
+            self.batch_runs.grid(row=8, column=1, padx=10, pady=5)
+
+        add_label(9, "Switch to selected algorithm on detection")
+        self.config_switch_detection = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            form,
+            variable=self.config_switch_detection,
+        ).grid(row=9, column=1, padx=10, pady=5, sticky="w")
 
         self.checkpoint_status_label = tk.Label(frame, text="", fg=COLOR_TEXT_MUTED, bg=COLOR_BACKGROUND, font=("Segoe UI", 10))
         self.checkpoint_status_label.pack(pady=4)
@@ -403,27 +642,96 @@ class PursuitEvasionApp:
         return form
 
     def _update_config_algorithms(self) -> None:
-        values = CLASSICAL_ALGORITHMS if self.config_family.get() == "Planner" else MARL_ALGORITHMS
+        unknown = self.config_knowledge.get() == "Unknown (Search)"
+        seed = int(self.config_seed_entry.get().strip()) if self.config_seed_entry.get().strip().lstrip("-").isdigit() else self.seed
+        grid_size = int(self.config_size.get().strip()) if self.config_size.get().strip().isdigit() else self.custom_grid_size
+        knowledge = KnowledgeMode.UNKNOWN if unknown else KnowledgeMode.KNOWN
+        unknown_marl_available = any(
+            _resolve_checkpoint_path(
+                algorithm, seed, grid_size, DEFAULT_PURSUER_COUNT, knowledge=knowledge
+            )
+            for algorithm in MARL_ALGORITHMS
+        )
+        family_values = ("Planner", "MARL") if not unknown or unknown_marl_available else ("Planner",)
+        self.config_family.configure(values=family_values)
+        if self.config_family.get() not in family_values:
+            self.config_family.set("Planner")
+        values = (
+            CLASSICAL_ALGORITHMS
+            if self.config_family.get() == "Planner"
+            else MARL_ALGORITHMS
+        )
         self.config_algorithm.configure(values=values)
         self.config_algorithm.set(values[0])
         self._check_checkpoint_status()
 
     def _check_checkpoint_status(self) -> None:
         if self.config_family.get() == "Planner":
-            self.checkpoint_status_label.config(text="ℹ️ Classical Planners execute exact search paths dynamically.", fg=COLOR_TEXT_LIGHT)
+            self.checkpoint_status_label.config(
+                text=(
+                    "Info: Unknown mode uses sensor-limited planner search."
+                    if self.config_knowledge.get() == "Unknown (Search)"
+                    else "Info: Classical Planners execute exact search paths dynamically."
+                ),
+                fg=COLOR_TEXT_LIGHT,
+            )
             return
 
-        alg = self.config_algorithm.get().lower()
         try:
             seed_val = int(self.config_seed_entry.get().strip())
         except ValueError:
             seed_val = self.seed
+        try:
+            grid_size = int(self.config_size.get().strip())
+        except ValueError:
+            grid_size = self.custom_grid_size
 
-        ckpt_path = Path("checkpoints") / f"{alg}_{seed_val}.pt"
-        if ckpt_path.exists():
-            self.checkpoint_status_label.config(text=f"🟢 Checkpoint Found: {ckpt_path}", fg=COLOR_SUCCESS)
+        ckpt_path = _resolve_checkpoint_path(
+            self.config_algorithm.get(),
+            seed_val,
+            grid_size,
+            DEFAULT_PURSUER_COUNT,
+            knowledge=(
+                KnowledgeMode.UNKNOWN
+                if self.config_knowledge.get() == "Unknown (Search)"
+                else KnowledgeMode.KNOWN
+            ),
+        )
+        if ckpt_path is not None:
+            try:
+                evaluation_mode = {
+                    "Maze": GameMode.MAZE,
+                    "Reach and Avoid": GameMode.REACH_AVOID,
+                    "Pure Pursuit": GameMode.PURE_PURSUIT,
+                }.get(self.config_mode.get(), GameMode.PURE_PURSUIT)
+                warning = _checkpoint_configuration_warning(
+                    ckpt_path,
+                    evaluation_mode,
+                    float(self.config_walls.get()),
+                    float(self.config_barrels.get()),
+                    KnowledgeMode.UNKNOWN
+                    if self.config_knowledge.get() == "Unknown (Search)"
+                    else KnowledgeMode.KNOWN,
+                )
+            except (OSError, RuntimeError, ValueError, KeyError) as error:
+                warning = f"Checkpoint metadata could not be read: {error}"
+            if warning:
+                self.checkpoint_status_label.config(
+                    text=f"Checkpoint Found: {ckpt_path}\nWarning: {warning}",
+                    fg=COLOR_FAILURE,
+                )
+            else:
+                self.checkpoint_status_label.config(
+                    text=f"Checkpoint Found: {ckpt_path}", fg=COLOR_SUCCESS
+                )
         else:
-            self.checkpoint_status_label.config(text=f"⚠️ No Checkpoint Found ({ckpt_path}). Will use fallback/random policy.", fg=COLOR_FAILURE)
+            knowledge_suffix = (
+                "_unknown"
+                if self.config_knowledge.get() == "Unknown (Search)"
+                else ""
+            )
+            expected = Path("checkpoints") / f"{self.config_algorithm.get().lower()}{knowledge_suffix}_{seed_val}[_best].pt"
+            self.checkpoint_status_label.config(text=f"Warning: No Checkpoint Found ({expected}). Will use fallback policy.", fg=COLOR_FAILURE)
 
     def _read_configuration(self) -> bool:
         try:
@@ -440,11 +748,43 @@ class PursuitEvasionApp:
             return False
 
         self.mode = {"Maze": GameMode.MAZE, "Reach and Avoid": GameMode.REACH_AVOID, "Pure Pursuit": GameMode.PURE_PURSUIT}[self.config_mode.get()]
+        self.knowledge = (
+            KnowledgeMode.UNKNOWN
+            if self.config_knowledge.get() == "Unknown (Search)"
+            else KnowledgeMode.KNOWN
+        )
         self.algorithm = self.config_algorithm.get()
+        self.switch_on_detection = bool(self.config_switch_detection.get())
+        self.viper_searcher.selected_algorithm = self.algorithm
+        self.viper_searcher.switch_on_detection = self.switch_on_detection
         self.seed = seed_val
         self.custom_grid_size = size
         self.custom_wall_density = walls
         self.custom_barrel_density = barrels
+        self.checkpoint_path = (
+            _resolve_checkpoint_path(
+                self.algorithm,
+                self.seed,
+                self.custom_grid_size,
+                DEFAULT_PURSUER_COUNT,
+                knowledge=self.knowledge,
+            )
+            if self.algorithm in MARL_ALGORITHMS
+            else None
+        )
+        self.evaluation_warning = None
+        if self.checkpoint_path is not None:
+            self.evaluation_warning = _checkpoint_configuration_warning(
+                self.checkpoint_path,
+                self.mode,
+                self.custom_wall_density,
+                self.custom_barrel_density,
+                self.knowledge,
+            )
+        self.checkpoint_message = None
+        self.perception = None
+        self.detection_step = None
+        self.viper_searcher.reset_episode()
         return True
 
     # Interactive Simulations
@@ -487,6 +827,14 @@ class PursuitEvasionApp:
         if not self._read_configuration():
             return
 
+        if self.algorithm in MARL_ALGORITHMS and self.checkpoint_path is None:
+            proceed = messagebox.askyesno(
+                "No MARL checkpoint",
+                "No checkpoint matches this MARL configuration. Run the batch with the BFS fallback policy?",
+            )
+            if not proceed:
+                return
+
         self._clear()
         frame = self._frame()
         self._title(frame, "Running Batch Benchmark", f"Evaluating {self.algorithm} across {runs} episode seed(s)...")
@@ -498,6 +846,11 @@ class PursuitEvasionApp:
         try:
             base_seed = self.seed
             captured = 0
+            trained_steps = 0
+            total_steps = 0
+            explored_percentages: list[float] = []
+            detection_steps: list[int] = []
+            detected_episodes = 0
             capture_steps: list[int] = []
             planning_seconds: list[float] = []
             episode_seconds: list[float] = []
@@ -508,17 +861,62 @@ class PursuitEvasionApp:
                     ScenarioSpec(grid_size=self.custom_grid_size, wall_density=self.custom_wall_density, barrel_density=self.custom_barrel_density, seed=episode_seed),
                     self.mode,
                 )
-                environment = PursuitEvasionEnv(scenario, self.mode, seed=episode_seed)
+                environment = PursuitEvasionEnv(
+                    scenario,
+                    self.mode,
+                    max_steps=self._max_steps_for_mode(scenario.rows, scenario.cols),
+                    seed=episode_seed,
+                )
                 environment.reset()
+                if self.knowledge == KnowledgeMode.UNKNOWN and hasattr(self, "viper_searcher"):
+                    self.viper_searcher.reset_episode()
+                perception = Perception() if self.knowledge == KnowledgeMode.UNKNOWN else None
+                episode_detection_step: int | None = 0 if self.knowledge == KnowledgeMode.KNOWN else None
                 episode_started = perf_counter()
                 info: dict = {"captured": False, "time": 0}
 
                 while not environment.done:
                     planning_started = perf_counter()
-                    pursuer_actions, evader_actions, _ = _autonomous_actions(environment, self.algorithm)
+                    if self.knowledge == KnowledgeMode.UNKNOWN:
+                        pursuer_actions, evader_actions, is_trained, checkpoint_message = _autonomous_actions(
+                            environment,
+                            self.algorithm,
+                            self.checkpoint_path,
+                            self.knowledge,
+                            perception,
+                            self.viper_searcher,
+                            self.switch_on_detection,
+                        )
+                    else:
+                        pursuer_actions, evader_actions, is_trained, checkpoint_message = _autonomous_actions(
+                            environment,
+                            self.algorithm,
+                            self.checkpoint_path,
+                            self.knowledge,
+                            perception,
+                        )
+                    self.checkpoint_message = checkpoint_message
+                    trained_steps += int(is_trained)
+                    total_steps += 1
+                    if (
+                        self.knowledge == KnowledgeMode.UNKNOWN
+                        and perception is not None
+                        and perception.pursuer_belief.visible_evaders
+                        and episode_detection_step is None
+                    ):
+                        episode_detection_step = environment.state.step_count
                     planning_seconds.append(perf_counter() - planning_started)
                     _, _, _, _, info = environment.step(pursuer_actions, evader_actions)
 
+                if self.knowledge == KnowledgeMode.UNKNOWN and perception is not None:
+                    explored_percentages.append(perception.pursuer_belief.coverage())
+                    if episode_detection_step is not None:
+                        detection_steps.append(episode_detection_step)
+                        detected_episodes += 1
+                else:
+                    explored_percentages.append(100.0)
+                    detection_steps.append(0)
+                    detected_episodes += 1
                 episode_seconds.append(perf_counter() - episode_started)
                 if bool(info.get("captured")):
                     captured += 1
@@ -529,23 +927,63 @@ class PursuitEvasionApp:
                 sum(capture_steps) / len(capture_steps) if capture_steps else 0.0,
                 sum(planning_seconds) / len(planning_seconds) * 1000,
                 sum(episode_seconds) / len(episode_seconds) * 1000,
+                trained_steps / total_steps * 100 if total_steps else 0.0,
+                sum(explored_percentages) / len(explored_percentages),
+                sum(detection_steps) / len(detection_steps) if detection_steps else 0.0,
+                detected_episodes / runs * 100,
             )
             self.root.after(0, lambda: self._show_batch_results(results, runs))
         except Exception as error:
             self.root.after(0, lambda: self._show_batch_error(error))
 
-    def _show_batch_results(self, results: tuple[float, float, float, float], runs: int) -> None:
-        success_rate, average_steps, latency_ms, average_time_ms = results
+    def _show_batch_results(self, results: tuple[float, ...], runs: int) -> None:
+        (
+            success_rate,
+            average_steps,
+            latency_ms,
+            average_time_ms,
+            trained_percentage,
+            explored_percentage,
+            detection_steps,
+            detection_rate,
+        ) = results
         self._clear()
         frame = self._frame()
-        self._title(frame, "Benchmark Results Summary", f"{self.algorithm} ({runs} Runs) | Mode: {MODE_LABELS[self.mode]}")
+        self._title(
+            frame,
+            "Benchmark Results Summary",
+            f"{self.algorithm} ({runs} Runs) | Mode: {MODE_LABELS[self.mode]} | "
+            f"Knowledge: {self.knowledge.value}",
+        )
         result_text = (
             f"• Success Rate (%): {success_rate:.1f}%\n\n"
             f"• Path Efficiency (Avg Steps to Capture): {average_steps:.1f}\n\n"
             f"• Latency / Decision Time per Step: {latency_ms:.3f} ms\n\n"
-            f"• Total Average Episode Execution Time: {average_time_ms:.3f} ms"
+            f"• Total Average Episode Execution Time: {average_time_ms:.3f} ms\n\n"
+            f"• Trained policy used in {trained_percentage:.1f}% of steps\n\n"
+            f"• Explored Area (Avg): {explored_percentage:.1f}%\n\n"
+            f"• Time to First Detection (Avg Steps): {detection_steps:.1f}\n\n"
+            f"• Detection Rate: {detection_rate:.1f}%"
         )
         tk.Label(frame, text=result_text, fg=COLOR_TEXT_LIGHT, bg=COLOR_BACKGROUND, justify=tk.LEFT, font=("Segoe UI", 12)).pack(pady=20)
+        if trained_percentage < 100:
+            tk.Label(
+                frame,
+                text="Warning: The trained policy was not used for every step.",
+                fg=COLOR_FAILURE,
+                bg=COLOR_BACKGROUND,
+                font=("Segoe UI", 11),
+            ).pack()
+        if getattr(self, "evaluation_warning", None):
+            tk.Label(
+                frame,
+                text=f"Warning: {self.evaluation_warning}",
+                fg=COLOR_FAILURE,
+                bg=COLOR_BACKGROUND,
+                font=("Segoe UI", 11),
+                wraplength=700,
+                justify=tk.LEFT,
+            ).pack()
         self._button(frame, "Run New Benchmark", self.show_simulation_config)
         self._button(frame, "Main Menu", self.show_main_menu)
 
@@ -583,7 +1021,7 @@ class PursuitEvasionApp:
         seed_controls = tk.Frame(form, bg=COLOR_BACKGROUND)
         seed_controls.grid(row=2, column=1, padx=10, pady=5)
         self.train_seed = ttk.Entry(seed_controls, width=19, justify="center")
-        self.train_seed.insert(0, "7")
+        self.train_seed.insert(0, "0")
         self.train_seed.pack(side=tk.LEFT)
         ttk.Button(
             seed_controls,
@@ -601,6 +1039,42 @@ class PursuitEvasionApp:
         self.train_pursuers = ttk.Entry(form, width=28, justify="center")
         self.train_pursuers.insert(0, "4")
         self.train_pursuers.grid(row=4, column=1, padx=10, pady=5)
+
+        add_label(5, "Game Mode")
+        self.train_mode = ttk.Combobox(
+            form,
+            values=("Maze", "Reach and Avoid", "Pure Pursuit"),
+            state="readonly",
+            width=25,
+        )
+        self.train_mode.set("Pure Pursuit")
+        self.train_mode.grid(row=5, column=1, padx=10, pady=5)
+
+        add_label(6, "Evader Behaviour")
+        self.train_evader_policy = ttk.Combobox(
+            form,
+            values=("Static", "Scripted Flee"),
+            state="readonly",
+            width=25,
+        )
+        self.train_evader_policy.set("Static")
+        self.train_evader_policy.grid(row=6, column=1, padx=10, pady=5)
+
+        add_label(7, "Density Caps")
+        self.train_cap_densities = tk.BooleanVar(value=True)
+        ttk.Checkbutton(form, variable=self.train_cap_densities).grid(
+            row=7, column=1, padx=10, pady=5, sticky="w"
+        )
+
+        add_label(8, "Environment Knowledge")
+        self.train_knowledge = ttk.Combobox(
+            form,
+            values=("Known", "Unknown (Search)"),
+            state="readonly",
+            width=25,
+        )
+        self.train_knowledge.set("Known")
+        self.train_knowledge.grid(row=8, column=1, padx=10, pady=5)
 
         self.train_error = tk.Label(frame, text="", fg=COLOR_ERROR, bg=COLOR_BACKGROUND, font=("Segoe UI", 10))
         self.train_error.pack(pady=4)
@@ -658,11 +1132,40 @@ class PursuitEvasionApp:
 
         Thread(
             target=self._run_training_worker,
-            args=(alg, seed, episodes, grid_size, pursuers),
+            args=(
+                alg,
+                seed,
+                episodes,
+                grid_size,
+                pursuers,
+                {
+                    "Maze": GameMode.MAZE,
+                    "Reach and Avoid": GameMode.REACH_AVOID,
+                    "Pure Pursuit": GameMode.PURE_PURSUIT,
+                }[self.train_mode.get()],
+                "scripted_flee"
+                if self.train_evader_policy.get() == "Scripted Flee"
+                else "static",
+                bool(self.train_cap_densities.get()),
+                KnowledgeMode.UNKNOWN
+                if self.train_knowledge.get() == "Unknown (Search)"
+                else KnowledgeMode.KNOWN,
+            ),
             daemon=True,
         ).start()
 
-    def _run_training_worker(self, alg: str, seed: int, episodes: int, grid_size: int, pursuers: int) -> None:
+    def _run_training_worker(
+        self,
+        alg: str,
+        seed: int,
+        episodes: int,
+        grid_size: int,
+        pursuers: int,
+        training_mode: GameMode = GameMode.PURE_PURSUIT,
+        evader_policy: str = "static",
+        cap_densities: bool = True,
+        knowledge: KnowledgeMode = KnowledgeMode.KNOWN,
+    ) -> None:
         try:
             trainer = TorchMixer(
                 algorithm=alg,
@@ -670,6 +1173,10 @@ class PursuitEvasionApp:
                 checkpoint_dir="checkpoints",
                 grid_size=grid_size,
                 pursuers=pursuers,
+                training_mode=training_mode,
+                evader_policy=evader_policy,
+                cap_densities=cap_densities,
+                knowledge=knowledge,
             )
 
             def callback(
@@ -727,27 +1234,139 @@ class PursuitEvasionApp:
 
     # Live Simulation Rendering
 
-    def _new_environment(self) -> PursuitEvasionEnv:
-        spec = ScenarioSpec(grid_size=self.custom_grid_size, wall_density=self.custom_wall_density, barrel_density=self.custom_barrel_density, seed=self.seed)
-        scenario = generate_scenario(spec, self.mode)
-        environment = PursuitEvasionEnv(scenario, self.mode)
+    def _max_steps_for_mode(self, rows: int, cols: int) -> int:
+        if self.knowledge == KnowledgeMode.UNKNOWN:
+            return UNKNOWN_MAX_STEPS_MULTIPLIER * rows * cols
+        return 200
+
+    def _create_environment(
+        self,
+        seed: int,
+        grid_size: int,
+        wall_density: float,
+        barrel_density: float,
+        mode: GameMode,
+        knowledge: KnowledgeMode,
+    ) -> PursuitEvasionEnv:
+        spec = ScenarioSpec(
+            grid_size=grid_size,
+            wall_density=wall_density,
+            barrel_density=barrel_density,
+            seed=seed,
+        )
+        scenario = generate_scenario(spec, mode)
+        environment = PursuitEvasionEnv(
+            scenario,
+            mode,
+            max_steps=(
+                UNKNOWN_MAX_STEPS_MULTIPLIER * scenario.rows * scenario.cols
+                if knowledge == KnowledgeMode.UNKNOWN
+                else 200
+            ),
+        )
         environment.reset()
+        return environment
+
+    def _new_environment(self) -> PursuitEvasionEnv:
+        environment = self._create_environment(
+            self.seed,
+            self.custom_grid_size,
+            self.custom_wall_density,
+            self.custom_barrel_density,
+            self.mode,
+            self.knowledge,
+        )
+        self.perception = Perception() if self.knowledge == KnowledgeMode.UNKNOWN else None
+        self.detection_step = 0 if self.knowledge == KnowledgeMode.KNOWN else None
         return environment
 
     def start_simulation(self, seed: int | None = None) -> None:
         self.seed = seed if seed is not None else SEED_GENERATOR.randrange(0, 2**32)
+        self._simulation_generation += 1
+        generation = self._simulation_generation
+        self.running = False
+        self._show_simulation_loading()
+        Thread(
+            target=self._load_simulation,
+            args=(
+                generation,
+                self.seed,
+                self.custom_grid_size,
+                self.custom_wall_density,
+                self.custom_barrel_density,
+                self.mode,
+                self.knowledge,
+            ),
+            daemon=True,
+        ).start()
 
+    def _show_simulation_loading(self) -> None:
+        self._clear()
+        frame = self._frame()
+        self._title(frame, "Preparing Simulation", f"Generating seed {self.seed}...")
+        tk.Label(
+            frame,
+            text="The simulation will appear when the scenario is ready.",
+            fg=COLOR_TEXT_MUTED,
+            bg=COLOR_BACKGROUND,
+            font=("Segoe UI", 11),
+        ).pack(pady=20)
+
+    def _load_simulation(
+        self,
+        generation: int,
+        seed: int,
+        grid_size: int,
+        wall_density: float,
+        barrel_density: float,
+        mode: GameMode,
+        knowledge: KnowledgeMode,
+    ) -> None:
         try:
-            self.environment = self._new_environment()
+            environment = self._create_environment(
+                seed,
+                grid_size,
+                wall_density,
+                barrel_density,
+                mode,
+                knowledge,
+            )
         except (RuntimeError, ValueError) as error:
+            self.root.after(
+                0,
+                lambda: self._finish_simulation_load(generation, None, error),
+            )
+            return
+        self.root.after(
+            0,
+            lambda: self._finish_simulation_load(generation, environment, None),
+        )
+
+    def _finish_simulation_load(
+        self,
+        generation: int,
+        environment: PursuitEvasionEnv | None,
+        error: Exception | None,
+    ) -> None:
+        if generation != self._simulation_generation:
+            return
+        if error is not None:
             self._show_runtime_error("Could not create the scenario", error)
             return
+        if environment is None:
+            self._show_runtime_error(
+                "Could not create the scenario",
+                RuntimeError("Scenario generation returned no environment."),
+            )
+            return
 
+        self.environment = environment
+        self.perception = Perception() if self.knowledge == KnowledgeMode.UNKNOWN else None
+        self.detection_step = 0 if self.knowledge == KnowledgeMode.KNOWN else None
         self.elapsed = 0.0
         self.started_at = perf_counter()
         self.paused = False
         self.running = True
-
         self._build_simulation_screen()
         self.root.after(SIMULATION_INTERVAL_MS, self.tick)
 
@@ -774,12 +1393,39 @@ class PursuitEvasionApp:
         self.pause_button = ttk.Button(panel, text="Pause", command=self.toggle_pause, style="Action.TButton")
         self.pause_button.pack(fill=tk.X, pady=4)
 
+        self.ground_truth_button = ttk.Button(
+            panel,
+            text="Show ground truth",
+            command=self._toggle_ground_truth,
+            style="Action.TButton",
+        )
+        self.ground_truth_button.pack(fill=tk.X, pady=4)
+
         ttk.Button(panel, text="New Seed", command=self.start_simulation, style="Action.TButton").pack(fill=tk.X, pady=4)
         ttk.Button(panel, text="Restart", command=lambda: self.start_simulation(self.seed), style="Action.TButton").pack(fill=tk.X, pady=4)
         ttk.Button(panel, text="Main Menu", command=self.show_main_menu, style="Action.TButton").pack(fill=tk.X, pady=4)
 
-        legend = tk.Label(panel, text="Green: Pursuers\nRed: Evader\nGold: Goal\nBrown: Barrel\nBlue line: Wall", fg=COLOR_TEXT_MUTED, bg=COLOR_BACKGROUND, justify=tk.LEFT, anchor="w")
+        legend = tk.Label(
+            panel,
+            text=(
+                "Green: Pursuers\nRed: Visible evader\nGold: Known goal\n"
+                "Brown: Known barrel\nBlue line: Known wall\n"
+                "Dark: Unexplored\nGrey: Contaminated\nTinted green: Cleared"
+            ),
+            fg=COLOR_TEXT_MUTED,
+            bg=COLOR_BACKGROUND,
+            justify=tk.LEFT,
+            anchor="w",
+        )
         legend.pack(side=tk.BOTTOM, fill=tk.X, pady=8)
+
+    def _toggle_ground_truth(self) -> None:
+        self.show_ground_truth = not self.show_ground_truth
+        if hasattr(self, "ground_truth_button"):
+            self.ground_truth_button.config(
+                text="Hide ground truth" if self.show_ground_truth else "Show ground truth"
+            )
+        self._draw()
 
     def _cell_box(self, position: Position) -> tuple[float, float, float, float]:
         row, col = position
@@ -795,25 +1441,49 @@ class PursuitEvasionApp:
     def _draw_grid(self) -> None:
         if not self.environment:
             return
+        if self.knowledge == KnowledgeMode.UNKNOWN and self.perception is not None:
+            belief = self.perception.pursuer_belief
+            for r in range(self.environment.scenario.rows):
+                for c in range(self.environment.scenario.cols):
+                    position = (r, c)
+                    if position in belief.contaminated_cells:
+                        fill = "#cbd5e1"
+                    elif position in belief.cleared_cells:
+                        fill = "#244b3a"
+                    elif position in belief.explored_cells:
+                        fill = "#1e293b"
+                    else:
+                        fill = "#0b1220"
+                    self.canvas.create_rectangle(*self._cell_box(position), fill=fill, outline="#334155")
+            return
         for r in range(self.environment.scenario.rows):
             for c in range(self.environment.scenario.cols):
                 self.canvas.create_rectangle(*self._cell_box((r, c)), fill="#1e293b", outline="#334155")
 
     def _draw_goals(self) -> None:
         if self.environment:
-            for g in self.environment.scenario.goals:
+            goals = self.environment.scenario.goals
+            if self.knowledge == KnowledgeMode.UNKNOWN and self.perception is not None:
+                goals = tuple(self.perception.pursuer_belief.known_goals)
+            for g in goals:
                 self.canvas.create_rectangle(*self._cell_box(g), fill="#d4a72c", outline="#f8d66d")
 
     def _draw_barrels(self) -> None:
         if self.environment:
-            for b in self.environment.scenario.barrels:
+            barrels = self.environment.scenario.barrels
+            if self.knowledge == KnowledgeMode.UNKNOWN and self.perception is not None:
+                barrels = self.perception.pursuer_belief.known_barrels
+            for b in barrels:
                 self._draw_circle(b, inset=0.16, fill="#8b5e3c", outline="#d9a066")
 
     def _draw_walls(self) -> None:
         if not self.environment:
             return
         line_width = max(3, int(self._cell_size * 0.08))
-        for pos, direction in self.environment.scenario.walls:
+        walls = self.environment.scenario.walls
+        if self.knowledge == KnowledgeMode.UNKNOWN and self.perception is not None:
+            walls = self.perception.pursuer_belief.known_walls
+        for pos, direction in walls:
             left, top, right, bottom = self._cell_box(pos)
             edges = {"up": (left, top, right, top), "down": (left, bottom, right, bottom), "left": (left, top, left, bottom), "right": (right, top, right, bottom)}
             self.canvas.create_line(*edges[direction], fill="#60a5fa", width=line_width)
@@ -825,8 +1495,58 @@ class PursuitEvasionApp:
 
     def _draw_evaders(self) -> None:
         if self.environment:
-            for e in self.environment.state.evaders:
+            if self.knowledge != KnowledgeMode.UNKNOWN or self.perception is None:
+                for e in self.environment.state.evaders:
+                    self._draw_circle(e, inset=0.18, fill="#f25f5c", outline="#ffd1d0")
+                return
+            if self.show_ground_truth:
+                for e in self.environment.state.evaders:
+                    self._draw_circle(e, inset=0.18, fill="#f25f5c", outline="#ffd1d0")
+                return
+            belief = self.perception.pursuer_belief
+            for e in belief.visible_evaders:
                 self._draw_circle(e, inset=0.18, fill="#f25f5c", outline="#ffd1d0")
+            if belief.last_seen_evader is not None:
+                last_seen = belief.last_seen_evader[0]
+                if last_seen not in belief.visible_evaders:
+                    left, top, right, bottom = self._cell_box(last_seen)
+                    self.canvas.create_oval(
+                        left + self._cell_size * 0.25,
+                        top + self._cell_size * 0.25,
+                        right - self._cell_size * 0.25,
+                        bottom - self._cell_size * 0.25,
+                        outline="#f25f5c",
+                        width=3,
+                        stipple="gray50",
+                    )
+
+    def _draw_ground_truth_overlay(self) -> None:
+        if (
+            not self.environment
+            or self.knowledge != KnowledgeMode.UNKNOWN
+            or not self.show_ground_truth
+        ):
+            return
+        scenario = self.environment.scenario
+        for barrel in scenario.barrels:
+            self._draw_circle(barrel, inset=0.16, fill="#8b5e3c", outline="#f8d66d", width=2)
+        for goal in scenario.goals:
+            left, top, right, bottom = self._cell_box(goal)
+            self.canvas.create_rectangle(
+                left, top, right, bottom, outline="#f8d66d", width=2, stipple="gray50"
+            )
+        line_width = max(2, int(self._cell_size * 0.05))
+        for position, direction in scenario.walls:
+            left, top, right, bottom = self._cell_box(position)
+            edges = {
+                "up": (left, top, right, top),
+                "down": (left, bottom, right, bottom),
+                "left": (left, top, left, bottom),
+                "right": (right, top, right, bottom),
+            }
+            self.canvas.create_line(*edges[direction], fill="#a78bfa", width=line_width, stipple="gray50")
+        for evader in self.environment.state.evaders:
+            self._draw_circle(evader, inset=0.18, fill="", outline="#f25f5c", width=3)
 
     def _draw(self) -> None:
         if not self.environment:
@@ -841,6 +1561,7 @@ class PursuitEvasionApp:
         self._offset_y = (canvas_h - self._cell_size * scenario.rows) / 2
 
         self._draw_grid()
+        self._draw_ground_truth_overlay()
         self._draw_goals()
         self._draw_barrels()
         self._draw_walls()
@@ -853,8 +1574,35 @@ class PursuitEvasionApp:
 
         if not self.paused and not self.environment.done:
             try:
-                pursuer_actions, evader_actions, is_trained = _autonomous_actions(self.environment, self.algorithm)
+                if self.knowledge == KnowledgeMode.UNKNOWN:
+                    pursuer_actions, evader_actions, is_trained, checkpoint_message = _autonomous_actions(
+                        self.environment,
+                        self.algorithm,
+                        self.checkpoint_path,
+                        self.knowledge,
+                        self.perception,
+                        self.viper_searcher,
+                        self.switch_on_detection,
+                    )
+                else:
+                    pursuer_actions, evader_actions, is_trained, checkpoint_message = _autonomous_actions(
+                        self.environment,
+                        self.algorithm,
+                        self.checkpoint_path,
+                        self.knowledge,
+                        self.perception,
+                    )
                 self.is_checkpoint_active = is_trained
+                self.checkpoint_message = checkpoint_message
+                if self.knowledge == KnowledgeMode.UNKNOWN and hasattr(self, "viper_searcher"):
+                    self.checkpoint_badge.config(text=self.viper_searcher.status_text)
+                if (
+                    self.knowledge == KnowledgeMode.UNKNOWN
+                    and self.perception is not None
+                    and self.perception.pursuer_belief.visible_evaders
+                    and self.detection_step is None
+                ):
+                    self.detection_step = self.environment.state.step_count
                 self.environment.step(pursuer_actions, evader_actions)
             except (RuntimeError, ValueError, IndexError) as error:
                 self.running = False
@@ -890,23 +1638,57 @@ class PursuitEvasionApp:
 
         status_lines = [
             f"Mode: {MODE_LABELS[self.mode]}",
+            f"Knowledge: {self.knowledge.value}",
             f"Algorithm: {self.algorithm}",
             f"Seed: {self.seed}",
             f"Grid {scenario.rows} x {scenario.cols}",
             f"Pursuers: {len(scenario.pursuers)}",
             f"Objects: {len(scenario.barrels)} barrels, {len(scenario.walls)} walls",
+            f"Max Steps: {self.environment.max_steps}",
+            (
+                f"Explored: {self.perception.pursuer_belief.coverage():.1f}%"
+                if self.knowledge == KnowledgeMode.UNKNOWN and self.perception is not None
+                else "Explored: 100.0%"
+            ),
+            (
+                f"Cleared: {len(self.perception.pursuer_belief.cleared_cells) / max(1, scenario.rows * scenario.cols) * 100:.1f}%"
+                if self.knowledge == KnowledgeMode.UNKNOWN and self.perception is not None
+                else "Cleared: 100.0%"
+            ),
+            (
+                f"Evader Visible: {'Yes' if self.perception.pursuer_belief.visible_evaders else 'No'}"
+                if self.knowledge == KnowledgeMode.UNKNOWN and self.perception is not None
+                else "Evader Visible: Yes"
+            ),
+            (
+                f"First Detection: {self.detection_step if self.detection_step is not None else 'Not detected'}"
+                if self.knowledge == KnowledgeMode.UNKNOWN
+                else "First Detection: 0"
+            ),
             f"Time: {self.elapsed:.1f}s",
             f"Step: {self.environment.state.step_count}",
         ]
         self.run_status.config(text="\n".join(status_lines))
 
-        if self.algorithm in MARL_ALGORITHMS:
+        if self.knowledge == KnowledgeMode.UNKNOWN:
+            search_status = (
+                self.viper_searcher.status_text
+                if hasattr(self, "viper_searcher")
+                else "Search: Fallback (0)"
+            )
+            self.checkpoint_badge.config(text=search_status, fg=COLOR_TEXT_LIGHT)
+        elif self.algorithm in MARL_ALGORITHMS:
             if self.is_checkpoint_active:
-                self.checkpoint_badge.config(text="Policy: 🟢 Trained Weights", fg=COLOR_SUCCESS)
+                self.checkpoint_badge.config(text="Policy: Trained Weights", fg=COLOR_SUCCESS)
+            elif self.checkpoint_message:
+                self.checkpoint_badge.config(
+                    text=f"Policy: Warning: {self.checkpoint_message}",
+                    fg=COLOR_FAILURE,
+                )
             else:
-                self.checkpoint_badge.config(text="Policy: ⚠️ Fallback Policy", fg=COLOR_FAILURE)
+                self.checkpoint_badge.config(text="Policy: Warning: Fallback Policy", fg=COLOR_FAILURE)
         else:
-            self.checkpoint_badge.config(text="Policy: 🔷 Classical Planner", fg=COLOR_TEXT_LIGHT)
+            self.checkpoint_badge.config(text="Policy: Classical Planner", fg=COLOR_TEXT_LIGHT)
 
         result_color = COLOR_TEXT_LIGHT
         if terminal_info:
@@ -949,6 +1731,6 @@ class PursuitEvasionApp:
         self.root.mainloop()
 
 
-def run_gui(seed: int = 7) -> None:
+def run_gui(seed: int = 0) -> None:
     app = PursuitEvasionApp(seed)
     app.run()

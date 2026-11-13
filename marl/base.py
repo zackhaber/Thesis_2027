@@ -73,3 +73,65 @@ class Mixer(nn.Module):
 
 def state_tensor(observation: dict) -> Tensor:
     return torch.tensor(observation["global_state"], dtype=torch.float32).unsqueeze(0)
+
+
+def belief_state_tensor(belief, env) -> Tensor:
+    """Encode the team belief using the global-state layout plus explored."""
+    state_vector: list[int] = []
+    pursuers = set(belief.pursuer_positions)
+    evaders = set(belief.visible_evaders)
+    for row in range(belief.rows):
+        for col in range(belief.cols):
+            position = (row, col)
+            state_vector.extend(
+                (
+                    int(position in pursuers),
+                    int(position in evaders),
+                    int(position in belief.known_barrels),
+                    int(position in belief.known_goals),
+                )
+            )
+            for direction in ("up", "down", "left", "right"):
+                state_vector.append(int((position, direction) in belief.known_walls))
+            state_vector.append(int(position in belief.explored_cells))
+    return torch.tensor(state_vector, dtype=torch.float32).unsqueeze(0)
+
+
+def belief_action_masks(belief, env) -> tuple[tuple[bool, ...], ...]:
+    """Build pursuer action masks using only known obstacles and walls."""
+    moves = {
+        "up": (-1, 0),
+        "down": (1, 0),
+        "left": (0, -1),
+        "right": (0, 1),
+    }
+    opposites = {"up": "down", "down": "up", "left": "right", "right": "left"}
+
+    def move(position, action):
+        if action == "stay":
+            return position
+        row, col = position
+        for _ in range(env.scenario.pursuer_speed):
+            next_position = (row + moves[action][0], col + moves[action][1])
+            if not (0 <= next_position[0] < belief.rows and 0 <= next_position[1] < belief.cols):
+                break
+            if (
+                ((position, action) in belief.known_walls)
+                or ((next_position, opposites[action]) in belief.known_walls)
+                or next_position in belief.known_barrels
+            ):
+                break
+            position = next_position
+        return position
+
+    masks = []
+    for position in belief.pursuer_positions:
+        masks.append(
+            tuple(
+                True
+                if action == "stay"
+                else move(position, action) != position
+                for action in ("stay", "up", "down", "left", "right")
+            )
+        )
+    return tuple(masks)
