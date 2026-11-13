@@ -1,14 +1,16 @@
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Callable
 
 import torch
 from torch import Tensor, nn
 
-from env import PursuitEvasionEnv, ScenarioSpec, generate_scenario
+from env import PursuitEvasionEnv, ScenarioSpec, generate_scenario, global_state_size
+from env.env import CTFRewards
 from env.game_modes import GameMode
-from env.knowledge import KnowledgeMode, Perception
+from env.knowledge import CTFKnowledgeConfig, KnowledgeMode, Perception
 from evader_policy import evader_action
+from strategies.ctf import attacker_belief_action
 
 from .base import (
     AgentNetwork,
@@ -27,7 +29,7 @@ SUPPORTED_ALGORITHMS = {"IQL", "VDN", "QMIX", "QTRAN", "QPLEX"}
 ACTION_NAMES = ("stay", "up", "down", "left", "right")
 ProgressCallback = Callable[[int, int, float, float, bool, int, float, float], None]
 TRAINING_MODE = GameMode.PURE_PURSUIT
-EVADER_POLICIES = {"static", "scripted", "scripted_flee"}
+EVADER_POLICIES = {"static", "scripted", "scripted_flee", "scripted_ctf"}
 UNKNOWN_COVERAGE_REWARD_SCALE = 0.01
 UNKNOWN_DETECTION_REWARD = 1.0
 DISTANCE_REWARD_SCALE = 0.05
@@ -91,9 +93,11 @@ class TorchMixer:
         wall_density: float = 0.5,
         barrel_density: float = 0.1,
         training_mode: GameMode = TRAINING_MODE,
-        evader_policy: str = "static",
+        evader_policy: str | None = None,
         cap_densities: bool = True,
         knowledge: KnowledgeMode = KnowledgeMode.KNOWN,
+        ctf_rewards: CTFRewards | None = None,
+        ctf_knowledge_config: CTFKnowledgeConfig | None = None,
     ):
         self.algorithm = algorithm.upper()
         if self.algorithm not in SUPPORTED_ALGORITHMS:
@@ -103,8 +107,12 @@ class TorchMixer:
             raise ValueError("grid_size must be at least 2 and pursuers must be positive")
         if not isinstance(training_mode, GameMode):
             raise ValueError("training_mode must be a GameMode")
+        if evader_policy is None:
+            evader_policy = "scripted_ctf" if training_mode == GameMode.CAPTURE_THE_FLAG else "static"
         if evader_policy not in EVADER_POLICIES:
-            raise ValueError("evader_policy must be 'static' or 'scripted'")
+            raise ValueError(f"evader_policy must be one of {sorted(EVADER_POLICIES)}")
+        if (evader_policy == "scripted_ctf") != (training_mode == GameMode.CAPTURE_THE_FLAG):
+            raise ValueError("CTF training requires scripted_ctf, which is only available for CTF.")
         if not isinstance(knowledge, KnowledgeMode):
             raise ValueError("knowledge must be a KnowledgeMode")
         self.seed = seed
@@ -117,6 +125,8 @@ class TorchMixer:
         self.evader_policy = evader_policy
         self.cap_densities = cap_densities
         self.knowledge = knowledge
+        self.ctf_rewards = ctf_rewards if ctf_rewards is not None else CTFRewards()
+        self.ctf_knowledge_config = ctf_knowledge_config or CTFKnowledgeConfig()
 
     def _scenario_densities(self) -> tuple[float, float]:
         if self.cap_densities:
@@ -137,7 +147,12 @@ class TorchMixer:
         self,
         environment: PursuitEvasionEnv,
         pursuer_actions: list[str] | None = None,
+        perception: Perception | None = None,
     ) -> list[str]:
+        if self.evader_policy == "scripted_ctf" and self.knowledge == KnowledgeMode.UNKNOWN:
+            if perception is None:
+                raise ValueError("Unknown CTF attacker requires perception.")
+            return [attacker_belief_action(belief) for belief in perception.ctf_attacker_beliefs]
         if self.evader_policy == "static":
             return ["stay"] * len(environment.state.evaders)
         pursuers: set[tuple[int, int]] = set()
@@ -149,6 +164,11 @@ class TorchMixer:
             pursuers.add(
                 environment._move(pursuer, action, environment.scenario.pursuer_speed)
             )
+        if environment.mode == GameMode.CAPTURE_THE_FLAG:
+            return [
+                evader_action(environment, evader, pursuers, attacker_index=index)
+                for index, evader in enumerate(environment.state.evaders)
+            ]
         return [
             evader_action(environment, evader, pursuers)
             for evader in environment.state.evaders
@@ -181,9 +201,10 @@ class TorchMixer:
             self.training_mode,
             max_steps=max(100, self.grid_size * 2),
             seed=self.seed,
+            ctf_rewards=self.ctf_rewards,
         )
         initial_observation = environment.reset()
-        state_size = len(initial_observation["global_state"])
+        state_size = global_state_size(scenario.rows, scenario.cols, self.training_mode)
         agent_count = len(initial_observation["pursuers"])
         agents = AgentNetwork(state_size, agent_count)
         target_agents = AgentNetwork(state_size, agent_count)
@@ -203,6 +224,9 @@ class TorchMixer:
         loss_moving_averages: list[float] = []
         evaluation_capture_rates: list[float] = []
         evaluation_average_steps: list[float] = []
+        ctf_win_rates: list[float] = []
+        ctf_flag_rates: list[float] = []
+        ctf_tag_steps: list[float | None] = []
         replay_buffer: list[Transition] = []
         best_checkpoint: str | None = None
         best_capture_rate = -1.0
@@ -225,6 +249,7 @@ class TorchMixer:
                 self.training_mode,
                 max_steps=max(100, self.grid_size * 2),
                 seed=episode_seed,
+                ctf_rewards=self.ctf_rewards,
             )
             observation = environment.reset()
             episode_reward = 0.0
@@ -234,7 +259,8 @@ class TorchMixer:
             epsilon = max(0.05, 1.0 - 0.95 * (episode - 1) / max(episodes - 1, 1))
 
             while not environment.done:
-                previous_distance = _nearest_evader_distance(observation)
+                if self.training_mode != GameMode.CAPTURE_THE_FLAG:
+                    previous_distance = _nearest_evader_distance(observation)
                 state = state_tensor(observation)
                 state_per_agent = state.repeat(agent_count, 1)
                 q_values = agents(state_per_agent, agent_ids)
@@ -260,15 +286,15 @@ class TorchMixer:
                         [ACTION_NAMES[int(action)] for action in actions],
                     ),
                 )
-                next_distance = _nearest_evader_distance(next_observation)
-                distance_progress = previous_distance - next_distance
-                training_reward = (
-                    reward["pursuers"]
-                    + DISTANCE_REWARD_SCALE * distance_progress
-                )
+                training_reward = reward["pursuers"]
+                if self.training_mode != GameMode.CAPTURE_THE_FLAG:
+                    next_distance = _nearest_evader_distance(next_observation)
+                    distance_progress = previous_distance - next_distance
+                    training_reward += DISTANCE_REWARD_SCALE * distance_progress
                 if info["captured"]:
                     captured = True
-                    training_reward = 1.0
+                    if self.training_mode != GameMode.CAPTURE_THE_FLAG:
+                        training_reward = 1.0
 
                 next_state = state_tensor(next_observation)
                 next_masks = torch.tensor(
@@ -358,9 +384,16 @@ class TorchMixer:
             evaluation_capture_rate = evaluation_capture_rates[-1] if evaluation_capture_rates else 0.0
             evaluation_steps = evaluation_average_steps[-1] if evaluation_average_steps else 0.0
             if episode % EVALUATION_INTERVAL == 0 or episode == episodes:
-                evaluation_capture_rate, evaluation_steps = self._evaluate(
-                    agents, state_size, agent_count, episode
-                )
+                if self.training_mode == GameMode.CAPTURE_THE_FLAG:
+                    evaluation_capture_rate, flag_rate, tag_steps = self._evaluate_ctf(agents, agent_count)
+                    ctf_win_rates.append(evaluation_capture_rate)
+                    ctf_flag_rates.append(flag_rate)
+                    ctf_tag_steps.append(tag_steps)
+                    evaluation_steps = tag_steps if tag_steps is not None else 0.0
+                else:
+                    evaluation_capture_rate, evaluation_steps = self._evaluate(
+                        agents, state_size, agent_count, episode
+                    )
                 evaluation_capture_rates.append(evaluation_capture_rate)
                 evaluation_average_steps.append(evaluation_steps)
                 if evaluation_capture_rate > best_capture_rate:
@@ -391,8 +424,11 @@ class TorchMixer:
             reward_moving_averages,
             loss_moving_averages,
             best_checkpoint,
-            evaluation_capture_rates,
-            evaluation_average_steps,
+            evaluation_capture_rates if self.training_mode != GameMode.CAPTURE_THE_FLAG else None,
+            evaluation_average_steps if self.training_mode != GameMode.CAPTURE_THE_FLAG else None,
+            ctf_win_rates or None,
+            ctf_flag_rates or None,
+            ctf_tag_steps or None,
         )
         self._write_results(result)
         return result
@@ -414,6 +450,7 @@ class TorchMixer:
             self.training_mode,
             max_steps=4 * scenario.rows * scenario.cols,
             seed=episode_seed,
+            ctf_rewards=self.ctf_rewards,
         )
 
     def _unknown_state(
@@ -431,7 +468,7 @@ class TorchMixer:
         callback: ProgressCallback | None,
     ) -> TrainingResult:
         environment = self._unknown_environment(self.seed)
-        perception = Perception()
+        perception = Perception(ctf_config=self.ctf_knowledge_config)
         environment.reset()
         perception.update(environment)
         state, masks = self._unknown_state(perception, environment)
@@ -454,6 +491,9 @@ class TorchMixer:
         loss_averages: list[float] = []
         evaluation_capture_rates: list[float] = []
         evaluation_average_steps: list[float] = []
+        ctf_win_rates: list[float] = []
+        ctf_flag_rates: list[float] = []
+        ctf_tag_steps: list[float | None] = []
         replay_buffer: list[Transition] = []
         best_checkpoint: str | None = None
         best_capture_rate = -1.0
@@ -464,7 +504,7 @@ class TorchMixer:
             episode_seed = self.seed + episode - 1
             environment = self._unknown_environment(episode_seed)
             environment.reset()
-            perception = Perception()
+            perception = Perception(ctf_config=self.ctf_knowledge_config)
             perception.update(environment)
             state, masks = self._unknown_state(perception, environment)
             episode_reward = 0.0
@@ -488,7 +528,7 @@ class TorchMixer:
                 )
                 actions = random_actions if torch.rand(()) < epsilon else greedy_actions
                 action_names = [ACTION_NAMES[int(action)] for action in actions]
-                evader_actions = self._evader_actions(environment, action_names)
+                evader_actions = self._evader_actions(environment, action_names, perception)
                 _, reward, terminated, truncated, info = environment.step(
                     action_names, evader_actions
                 )
@@ -501,14 +541,16 @@ class TorchMixer:
                     not detected and bool(perception.pursuer_belief.visible_evaders)
                 )
                 detected = detected or newly_detected
-                training_reward = (
-                    reward["pursuers"]
-                    + UNKNOWN_COVERAGE_REWARD_SCALE * newly_explored
-                    + (UNKNOWN_DETECTION_REWARD if newly_detected else 0.0)
-                )
+                training_reward = reward["pursuers"]
+                if self.training_mode != GameMode.CAPTURE_THE_FLAG:
+                    training_reward += (
+                        UNKNOWN_COVERAGE_REWARD_SCALE * newly_explored
+                        + (UNKNOWN_DETECTION_REWARD if newly_detected else 0.0)
+                    )
                 if info["captured"]:
                     captured = True
-                    training_reward = 1.0
+                    if self.training_mode != GameMode.CAPTURE_THE_FLAG:
+                        training_reward = 1.0
                 next_state, next_masks = self._unknown_state(perception, environment)
                 replay_buffer.append(
                     Transition(
@@ -597,9 +639,16 @@ class TorchMixer:
                 evaluation_average_steps[-1] if evaluation_average_steps else 0.0
             )
             if episode % EVALUATION_INTERVAL == 0 or episode == episodes:
-                evaluation_capture_rate, evaluation_steps = self._evaluate_unknown(
-                    agents, state_size, agent_count, episode
-                )
+                if self.training_mode == GameMode.CAPTURE_THE_FLAG:
+                    evaluation_capture_rate, flag_rate, tag_steps = self._evaluate_ctf(agents, agent_count)
+                    ctf_win_rates.append(evaluation_capture_rate)
+                    ctf_flag_rates.append(flag_rate)
+                    ctf_tag_steps.append(tag_steps)
+                    evaluation_steps = tag_steps if tag_steps is not None else 0.0
+                else:
+                    evaluation_capture_rate, evaluation_steps = self._evaluate_unknown(
+                        agents, state_size, agent_count, episode
+                    )
                 evaluation_capture_rates.append(evaluation_capture_rate)
                 evaluation_average_steps.append(evaluation_steps)
                 if evaluation_capture_rate > best_capture_rate:
@@ -630,11 +679,61 @@ class TorchMixer:
             reward_averages,
             loss_averages,
             best_checkpoint,
-            evaluation_capture_rates,
-            evaluation_average_steps,
+            evaluation_capture_rates if self.training_mode != GameMode.CAPTURE_THE_FLAG else None,
+            evaluation_average_steps if self.training_mode != GameMode.CAPTURE_THE_FLAG else None,
+            ctf_win_rates or None,
+            ctf_flag_rates or None,
+            ctf_tag_steps or None,
         )
         self._write_results(result)
         return result
+
+    def _evaluate_ctf(
+        self, agents: AgentNetwork, agent_count: int
+    ) -> tuple[float, float, float | None]:
+        """Evaluate on the same held-out seeds at every training checkpoint."""
+        defender_wins = 0
+        flag_captures = 0
+        tag_steps: list[int] = []
+        agent_ids = torch.arange(agent_count)
+        agents.eval()
+        try:
+            for index in range(EVALUATION_EPISODES):
+                seed = self.seed + 1_000_000 + index
+                environment = self._unknown_environment(seed)
+                environment.max_steps = self._max_steps()
+                observation = environment.reset()
+                perception = Perception(ctf_config=self.ctf_knowledge_config)
+                if self.knowledge == KnowledgeMode.UNKNOWN:
+                    perception.update(environment)
+                while not environment.done:
+                    if self.knowledge == KnowledgeMode.UNKNOWN:
+                        state, masks = self._unknown_state(perception, environment)
+                    else:
+                        state = state_tensor(observation)
+                        masks = torch.tensor(observation["action_masks"]["pursuers"], dtype=torch.bool)
+                    with torch.no_grad():
+                        values = agents(state.repeat(agent_count, 1), agent_ids)
+                        actions = [
+                            ACTION_NAMES[int(row.masked_fill(~mask, -torch.inf).argmax())]
+                            for row, mask in zip(values, masks)
+                        ]
+                    observation, _, _, _, info = environment.step(
+                        actions, self._evader_actions(environment, actions, perception)
+                    )
+                    if self.knowledge == KnowledgeMode.UNKNOWN:
+                        perception.update(environment)
+                flag_captures += int(info["flag_captured"])
+                defender_wins += int(not info["flag_captured"])
+                if info["captured"]:
+                    tag_steps.append(environment.state.step_count)
+        finally:
+            agents.train()
+        return (
+            defender_wins / EVALUATION_EPISODES,
+            flag_captures / EVALUATION_EPISODES,
+            sum(tag_steps) / len(tag_steps) if tag_steps else None,
+        )
 
     def _evaluate_unknown(
         self,
@@ -763,12 +862,14 @@ class TorchMixer:
             (
                 f"Unknown shaping: coverage gain {UNKNOWN_COVERAGE_REWARD_SCALE} per cell; "
                 f"first detection {UNKNOWN_DETECTION_REWARD}; capture reward unchanged"
-                if self.knowledge == KnowledgeMode.UNKNOWN
+                if self.knowledge == KnowledgeMode.UNKNOWN and self.training_mode != GameMode.CAPTURE_THE_FLAG
+                else "CTF shaping: none; environment rewards only"
+                if self.training_mode == GameMode.CAPTURE_THE_FLAG
                 else "Shaping: distance progress reward unchanged"
             ),
             f"Training wall density: {self._scenario_densities()[0]}",
             f"Training barrel density: {self._scenario_densities()[1]}",
-            f"Distance reward scale: {DISTANCE_REWARD_SCALE}",
+            f"Distance reward scale: {0.0 if self.training_mode == GameMode.CAPTURE_THE_FLAG else DISTANCE_REWARD_SCALE}",
             f"Checkpoint: {result.checkpoint or 'Not saved'}",
             f"Best checkpoint: {result.best_checkpoint or 'Not saved'}",
             f"Learning rate: {LEARNING_RATE}",
@@ -781,6 +882,14 @@ class TorchMixer:
             "---------------",
             "Episode | Seed | Reward | TD Loss | Captured | Steps | 25-Episode Avg Reward | 25-Episode Avg Loss",
         ]
+        if self.training_mode == GameMode.CAPTURE_THE_FLAG:
+            lines[lines.index("Episode details"):lines.index("Episode details")] = [
+                f"Game mode: {self.training_mode.value}",
+                f"Attacker policy: {self.evader_policy}",
+                f"CTF rewards: {asdict(self.ctf_rewards)}",
+                f"CTF knowledge: {asdict(self.ctf_knowledge_config)}",
+                "",
+            ]
         for index, (reward, loss) in enumerate(
             zip(result.rewards, result.losses), start=1
         ):
@@ -819,7 +928,20 @@ class TorchMixer:
                 f"Best checkpoint: {result.best_checkpoint or 'Not saved'}",
             ]
         )
-        if result.evaluation_capture_rates:
+        if result.evaluation_defender_win_rates:
+            lines.extend((
+                "", "CTF greedy evaluation (fixed scenarios)",
+                "---------------------------------------",
+                "Evaluation | Defender win rate | Flag capture rate | Mean steps to tag",
+            ))
+            for index, (win_rate, flag_rate, tag_steps) in enumerate(zip(
+                result.evaluation_defender_win_rates,
+                result.evaluation_flag_capture_rates or [],
+                result.evaluation_mean_tag_steps or [],
+            ), start=1):
+                mean = f"{tag_steps:.2f}" if tag_steps is not None else "N/A"
+                lines.append(f"{index} | {win_rate:.2%} | {flag_rate:.2%} | {mean}")
+        elif result.evaluation_capture_rates:
             lines.extend(
                 [
                     "",
@@ -851,14 +973,14 @@ class TorchMixer:
         if self.checkpoint_dir is None:
             return None
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        knowledge_suffix = (
-            f"_{self.knowledge.value}" if self.knowledge == KnowledgeMode.UNKNOWN else ""
+        path = self.checkpoint_dir / (
+            f"{self.algorithm.lower()}_{self.training_mode.value}_{self.knowledge.value}_{self.seed}{suffix}.pt"
         )
-        path = self.checkpoint_dir / f"{self.algorithm.lower()}{knowledge_suffix}_{self.seed}{suffix}.pt"
         torch.save(
             {
                 "algorithm": self.algorithm,
                 "knowledge_mode": self.knowledge.value,
+                "game_mode": self.training_mode.value,
                 "agents": agents.state_dict(),
                 "mixer": mixer.state_dict(),
                 "state_size": state_size,
@@ -872,7 +994,9 @@ class TorchMixer:
                 "barrel_density": self.barrel_density,
                 "training_wall_density": self._scenario_densities()[0],
                 "training_barrel_density": self._scenario_densities()[1],
-                "distance_reward_scale": DISTANCE_REWARD_SCALE,
+                "distance_reward_scale": 0.0 if self.training_mode == GameMode.CAPTURE_THE_FLAG else DISTANCE_REWARD_SCALE,
+                "ctf_rewards": asdict(self.ctf_rewards) if self.training_mode == GameMode.CAPTURE_THE_FLAG else None,
+                "ctf_knowledge_config": asdict(self.ctf_knowledge_config) if self.training_mode == GameMode.CAPTURE_THE_FLAG else None,
                 "learning_rate": LEARNING_RATE,
                 "replay_capacity": REPLAY_CAPACITY,
                 "replay_batch_size": REPLAY_BATCH_SIZE,
@@ -893,9 +1017,11 @@ def build_agent(
     wall_density: float = 0.5,
     barrel_density: float = 0.1,
     training_mode: GameMode = TRAINING_MODE,
-    evader_policy: str = "static",
+    evader_policy: str | None = None,
     cap_densities: bool = True,
     knowledge: KnowledgeMode = KnowledgeMode.KNOWN,
+    ctf_rewards: CTFRewards | None = None,
+    ctf_knowledge_config: CTFKnowledgeConfig | None = None,
 ) -> TorchMixer:
     return TorchMixer(
         name,
@@ -909,4 +1035,6 @@ def build_agent(
         evader_policy,
         cap_densities,
         knowledge,
+        ctf_rewards,
+        ctf_knowledge_config,
     )

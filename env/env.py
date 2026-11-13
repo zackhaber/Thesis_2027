@@ -47,11 +47,37 @@ class State:
     pursuers: list[Position]
     evaders: list[Position]
     step_count: int
+    flag_carrier: int | None = None
+    previous_evaders: tuple[Position, ...] = ()
+
+
+@dataclass(frozen=True)
+class CTFRewards:
+    """CTF team rewards: step cost plus any pickup and terminal event rewards."""
+    defender_tag: float = 1.0
+    defender_timeout: float = 0.5
+    defender_flag_captured: float = -1.0
+    defender_flag_pickup: float = -0.1
+    defender_step: float = -0.01
+    attacker_flag_captured: float = 1.0
+    attacker_tagged: float = -1.0
+    attacker_flag_pickup: float = 0.1
+    attacker_timeout: float = -0.5
+    attacker_step: float = -0.01
+
+
+def global_state_size(rows: int, cols: int, mode: GameMode) -> int:
+    """Return the size of the full-observation state vector."""
+    return rows * cols * (11 if mode == GameMode.CAPTURE_THE_FLAG else 8)
 
 
 class PursuitEvasionEnv:
     """
     The main multi-agent pursuit-evasion grid world environment.
+
+    In CTF, goals[0] is the flag home and bases are shared attacker return
+    cells. A tag takes precedence over pickup and return; pickup_step and
+    capture_step in info persist until reset, while event flags are per-step.
     """
 
     def __init__(
@@ -60,6 +86,7 @@ class PursuitEvasionEnv:
         mode: GameMode = GameMode.PURE_PURSUIT,
         max_steps: int = 200,
         seed: int | None = None,
+        ctf_rewards: CTFRewards | None = None,
     ):
         # Keep immutable scenario parameters separate from mutable episode state
         self.scenario = scenario
@@ -67,6 +94,11 @@ class PursuitEvasionEnv:
         self.max_steps = max_steps
         self.seed = scenario.seed if seed is None else seed
         self.rng = Random(self.seed)
+        if mode == GameMode.CAPTURE_THE_FLAG and (not scenario.goals or not scenario.bases):
+            raise ValueError("CTF requires a flag home in goals and at least one attacker base.")
+        self.ctf_rewards = ctf_rewards if ctf_rewards is not None else CTFRewards()
+        self._pickup_step: int | None = None
+        self._capture_step: int | None = None
 
         # Dynamic state & episode flags
         self.state = State(pursuers=[], evaders=[], step_count=0)
@@ -83,6 +115,8 @@ class PursuitEvasionEnv:
         self.rng = Random(self.seed)
         self.terminated = False
         self.truncated = False
+        self._pickup_step = None
+        self._capture_step = None
         return self.observe()
 
     @property
@@ -105,7 +139,7 @@ class PursuitEvasionEnv:
                 self._agent_observation(pos, "evader") for pos in self.state.evaders
             ),
         }
-        return {
+        observation = {
             "pursuers": tuple(self.state.pursuers),
             "evaders": tuple(self.state.evaders),
             "barrels": self.scenario.barrels,
@@ -116,11 +150,24 @@ class PursuitEvasionEnv:
             "global_state": self._global_state(),
             "action_masks": self._action_masks(),
         }
+        if self.mode == GameMode.CAPTURE_THE_FLAG:
+            observation["flag"] = {
+                "position": self._flag_position(),
+                "carrier": self.state.flag_carrier,
+                "home": self.scenario.goals[0],
+            }
+            observation["bases"] = self.scenario.bases
+        return observation
+
+    def _flag_position(self) -> Position:
+        carrier = self.state.flag_carrier
+        return self.scenario.goals[0] if carrier is None else self.state.evaders[carrier]
 
     def _global_state(self) -> tuple[int, ...]:
         """
         Encodes the entire grid into a flat 1D binary feature vector for MARL value mixers.
         For each cell: [is_pursuer, is_evader, is_barrel, is_goal, wall_up, wall_down, wall_left, wall_right]
+        CTF appends [flag_here, base_here, carrier_here] to each cell.
         """
         state_vector: list[int] = []
         for row in range(self.scenario.rows):
@@ -137,6 +184,13 @@ class PursuitEvasionEnv:
                 for direction in ("up", "down", "left", "right"):
                     has_wall = (pos, direction) in self.scenario.walls
                     state_vector.append(int(has_wall))
+                if self.mode == GameMode.CAPTURE_THE_FLAG:
+                    carrier = self.state.flag_carrier
+                    state_vector.extend((
+                        int(pos == self._flag_position()),
+                        int(pos in self.scenario.bases),
+                        int(carrier is not None and pos == self.state.evaders[carrier]),
+                    ))
 
         return tuple(state_vector)
 
@@ -312,6 +366,10 @@ class PursuitEvasionEnv:
         self.state.evaders = moved_evaders
         self.state.step_count += 1
 
+        if self.mode == GameMode.CAPTURE_THE_FLAG:
+            self.state.previous_evaders = tuple(previous_evaders)
+            return self._step_ctf()
+
         # Step 4: Evaluate terminal conditions
         captured = any(evader in self.state.pursuers for evader in self.state.evaders)
         reached_goal = (
@@ -335,6 +393,70 @@ class PursuitEvasionEnv:
             "truncated": self.truncated,
         }
 
+        return (
+            self.observe(),
+            {"pursuers": pursuer_reward, "evaders": evader_reward},
+            self.terminated,
+            self.truncated,
+            info,
+        )
+
+    def _step_ctf(self) -> tuple[dict, dict, bool, bool, dict]:
+        tagged = {
+            index for index, position in enumerate(self.state.evaders)
+            if position in self.state.pursuers
+        }
+        captured = bool(tagged)
+        carrier = self.state.flag_carrier
+        flag_dropped = carrier is not None and carrier in tagged
+        flag_picked_up = False
+        flag_captured = False
+
+        if flag_dropped:
+            self.state.flag_carrier = None
+        if not captured:
+            if carrier is None:
+                for index, position in enumerate(self.state.evaders):
+                    if position == self.scenario.goals[0]:
+                        self.state.flag_carrier = index
+                        self._pickup_step = self.state.step_count
+                        flag_picked_up = True
+                        break
+            carrier = self.state.flag_carrier
+            if carrier is not None and self.state.evaders[carrier] in self.scenario.bases:
+                flag_captured = True
+                self._capture_step = self.state.step_count
+
+        self.terminated = captured or flag_captured
+        self.truncated = self.state.step_count >= self.max_steps and not self.terminated
+        rewards = self.ctf_rewards
+        pursuer_reward = rewards.defender_step
+        evader_reward = rewards.attacker_step
+        if captured:
+            pursuer_reward += rewards.defender_tag
+            evader_reward += rewards.attacker_tagged
+        elif flag_captured:
+            pursuer_reward += rewards.defender_flag_captured
+            evader_reward += rewards.attacker_flag_captured
+        elif self.truncated:
+            pursuer_reward += rewards.defender_timeout
+            evader_reward += rewards.attacker_timeout
+        if flag_picked_up:
+            pursuer_reward += rewards.defender_flag_pickup
+            evader_reward += rewards.attacker_flag_pickup
+
+        info = {
+            "captured": captured,
+            "reached_goal": False,
+            "time": self.state.step_count,
+            "terminated": self.terminated,
+            "truncated": self.truncated,
+            "flag_picked_up": flag_picked_up,
+            "flag_captured": flag_captured,
+            "flag_dropped": flag_dropped,
+            "pickup_step": self._pickup_step,
+            "capture_step": self._capture_step,
+        }
         return (
             self.observe(),
             {"pursuers": pursuer_reward, "evaders": evader_reward},

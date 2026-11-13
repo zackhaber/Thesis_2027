@@ -4,6 +4,7 @@ Handles grid generation, object placement (barrels, walls, goals),
 and reachability verification using Breadth-First Search (BFS).
 """
 
+from collections import deque
 from dataclasses import dataclass
 from random import Random
 from .game_modes import GameMode
@@ -44,6 +45,7 @@ class ScenarioSpec:
     wall_density: float = 0.5
     goals: int = 1
     seed: int = 0
+    defender_radius: int = 3
 
 # Immutable finished board layout passed into the environment.
 @dataclass(frozen=True)
@@ -58,6 +60,7 @@ class Scenario:
     pursuer_speed: int
     evader_speed: int
     seed: int
+    bases: tuple[Position, ...] = ()
 
 # Calculate the grid step distance between two positions.
 def _manhattan_distance(p1: Position, p2: Position) -> int:
@@ -138,11 +141,97 @@ def _is_valid_scenario(
     return True
 
 
+def _ctf_distances(
+    start: Position,
+    size: int,
+    barrels: frozenset[Position],
+    walls: frozenset[tuple[Position, Direction]],
+) -> dict[Position, int]:
+    distances = {start: 0}
+    pending = deque([start])
+    while pending:
+        position = pending.popleft()
+        for direction, (dr, dc) in MOVEMENT_DELTAS.items():
+            neighbor = (position[0] + dr, position[1] + dc)
+            if (
+                not (0 <= neighbor[0] < size and 0 <= neighbor[1] < size)
+                or neighbor in barrels
+                or neighbor in distances
+                or (position, direction) in walls
+                or (neighbor, OPPOSITE_DIRECTION[direction]) in walls
+            ):
+                continue
+            distances[neighbor] = distances[position] + 1
+            pending.append(neighbor)
+    return distances
+
+
+def _generate_ctf_scenario(spec: ScenarioSpec) -> Scenario:
+    if spec.grid_size < 2 or spec.pursuers < 1 or spec.evaders < 1:
+        raise ValueError("CTF requires a grid of at least 2 and at least one agent per team.")
+    if spec.defender_radius < 0:
+        raise ValueError("defender_radius must be non-negative.")
+    if not 0 <= spec.barrel_density <= 1 or not 0 <= spec.wall_density <= 1:
+        raise ValueError("CTF obstacle densities must be between 0 and 1.")
+
+    size = spec.grid_size
+    for attempt in range(100):
+        rng = Random(spec.seed + attempt)
+        cells = [(row, col) for row in range(size) for col in range(size)]
+        rng.shuffle(cells)
+        flag = cells.pop()
+        barrel_count = min(len(cells), int(size * size * spec.barrel_density))
+        barrels = frozenset(cells.pop() for _ in range(barrel_count))
+        wall_count = min(len(cells), int(size * size * spec.wall_density))
+        walls = frozenset(
+            (cells.pop(), rng.choice(("up", "down", "left", "right")))
+            for _ in range(wall_count)
+        )
+        distances = _ctf_distances(flag, size, barrels, walls)
+        free_cells = [
+            (row, col)
+            for row in range(size)
+            for col in range(size)
+            if (row, col) in distances and (row, col) != flag
+        ]
+        if not free_cells:
+            continue
+        rng.shuffle(free_cells)
+        base = max(free_cells, key=distances.__getitem__)
+        defenders = [
+            cell for cell in free_cells
+            if cell != base
+            and distances[cell] <= spec.defender_radius
+            and _manhattan_distance(cell, base) >= 2
+        ][:spec.pursuers]
+        if len(defenders) != spec.pursuers:
+            continue
+        attackers = (base,) * spec.evaders
+        if _is_valid_scenario(defenders, attackers, (flag, base), size, barrels, walls):
+            return Scenario(
+                rows=size,
+                cols=size,
+                pursuers=tuple(defenders),
+                evaders=attackers,
+                barrels=barrels,
+                walls=walls,
+                goals=(flag,),
+                pursuer_speed=spec.pursuer_speed,
+                evader_speed=spec.evader_speed,
+                seed=spec.seed + attempt,
+                bases=(base,),
+            )
+    raise ValueError(f"Could not generate a valid scenario for seed {spec.seed} after 100 attempts.")
+
+
 """
     Generates a deterministic board matching the provided spec and game mode.
     Retries up to 100 times with modified seeds until a valid board is generated.
     """
 def generate_scenario(spec: ScenarioSpec, mode: GameMode = GameMode.PURE_PURSUIT) -> Scenario:
+    """Generate a deterministic scenario; CTF uses one shared attacker base."""
+    if mode == GameMode.CAPTURE_THE_FLAG:
+        return _generate_ctf_scenario(spec)
     size = spec.grid_size
     barrel_density = spec.barrel_density
     wall_density = spec.wall_density

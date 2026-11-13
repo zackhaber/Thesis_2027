@@ -290,7 +290,10 @@ class ViperSearcher:
         self._sync_sensor_radius(belief)
         belief.pursuer_positions = positions
         self._load_policy()
-        if self.switch_on_detection and belief.visible_evaders:
+        if not self.switch_on_detection:
+            self._handoff_active = False
+            self._unseen_count = 0
+        elif belief.visible_evaders:
             self._handoff_active = True
             self._unseen_count = 0
         elif self._handoff_active:

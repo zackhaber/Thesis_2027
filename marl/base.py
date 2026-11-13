@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
+from env.game_modes import GameMode
 
 ACTION_COUNT = 5
 
@@ -19,6 +20,9 @@ class TrainingResult:
     best_checkpoint: str | None = None
     evaluation_capture_rates: list[float] | None = None
     evaluation_average_steps: list[float] | None = None
+    evaluation_defender_win_rates: list[float] | None = None
+    evaluation_flag_capture_rates: list[float] | None = None
+    evaluation_mean_tag_steps: list[float | None] | None = None
 
 
 class AgentNetwork(nn.Module):
@@ -76,7 +80,7 @@ def state_tensor(observation: dict) -> Tensor:
 
 
 def belief_state_tensor(belief, env) -> Tensor:
-    """Encode the team belief using the global-state layout plus explored."""
+    """Encode known cells, CTF knowledge when applicable, then explored."""
     state_vector: list[int] = []
     pursuers = set(belief.pursuer_positions)
     evaders = set(belief.visible_evaders)
@@ -93,6 +97,18 @@ def belief_state_tensor(belief, env) -> Tensor:
             )
             for direction in ("up", "down", "left", "right"):
                 state_vector.append(int((position, direction) in belief.known_walls))
+            if env.mode == GameMode.CAPTURE_THE_FLAG:
+                if belief.ctf_template is None:
+                    raise ValueError("CTF belief has not been initialized.")
+                known_flag = (
+                    belief.visible_flag_carrier if belief.flag_taken
+                    else belief.ctf_template.goals[0]
+                )
+                state_vector.extend((
+                    int(position == known_flag),
+                    int(position in belief.ctf_template.bases),
+                    int(position == belief.visible_flag_carrier),
+                ))
             state_vector.append(int(position in belief.explored_cells))
     return torch.tensor(state_vector, dtype=torch.float32).unsqueeze(0)
 

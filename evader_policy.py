@@ -2,6 +2,7 @@
 
 from env.env import Action, PursuitEvasionEnv
 from env.game_modes import GameMode
+from strategies.ctf import attacker_action
 
 Position = tuple[int, int]
 MOVEMENT_ACTIONS: tuple[Action, ...] = ("up", "down", "left", "right")
@@ -59,8 +60,34 @@ def evader_action(
     environment: PursuitEvasionEnv,
     evader: Position,
     pursuer_positions: set[Position],
+    *,
+    attacker_index: int | None = None,
 ) -> Action:
     """Compute the existing UI fleeing policy without changing its behavior."""
+    if environment.mode == GameMode.CAPTURE_THE_FLAG:
+        carrier = environment.state.flag_carrier
+        if attacker_index is None and carrier is not None:
+            matches = [index for index, position in enumerate(environment.state.evaders) if position == evader]
+            if len(matches) != 1:
+                raise ValueError("attacker_index is required when attackers share a position.")
+            attacker_index = matches[0]
+        if attacker_index is not None and (
+            not 0 <= attacker_index < len(environment.state.evaders)
+            or environment.state.evaders[attacker_index] != evader
+        ):
+            raise ValueError("attacker_index must identify the supplied attacker position.")
+        return attacker_action(
+            environment.scenario,
+            evader,
+            pursuer_positions,
+            carrier is not None and carrier == attacker_index,
+            environment.state.evaders[carrier] if carrier is not None else environment.scenario.goals[0],
+            previous_position=(
+                environment.state.previous_evaders[attacker_index]
+                if attacker_index is not None and attacker_index < len(environment.state.previous_evaders)
+                else None
+            ),
+        )
     goal_mode = environment.mode in (GameMode.REACH_AVOID, GameMode.MAZE)
 
     if goal_mode:
